@@ -28,6 +28,10 @@ python -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw 'Python dependencies installation failed' }
 python -m pytest -q tests
 if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
+# Start both real Qt windows headlessly on the Windows build host.
+$env:QT_QPA_PLATFORM = 'offscreen'
+python main.py --gui-self-test
+if ($LASTEXITCODE -ne 0) { throw 'Qt GUI smoke test failed before packaging' }
 python tools/create_icon.py
 if ($LASTEXITCODE -ne 0) { throw 'Icon creation failed' }
 python -m PyInstaller --noconfirm --clean --windowed --onedir `
@@ -37,6 +41,8 @@ if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 $bundle = Join-Path $root 'dist\MangaOfflineTranslator\MangaOfflineTranslator.exe'
 & $bundle --self-test
 if ($LASTEXITCODE -ne 0) { throw 'Bundled executable self-test failed' }
+& $bundle --gui-self-test
+if ($LASTEXITCODE -ne 0) { throw 'Bundled Qt GUI smoke test failed' }
 
 $iscc = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",

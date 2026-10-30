@@ -3,6 +3,22 @@ Set-StrictMode -Version Latest
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $root
 
+# GUI-subsystem programs are not reliably awaited by PowerShell's call operator (&).
+# Use Start-Process and a bounded wait so a crash dialog cannot stall CI forever.
+function Assert-GuiExecutable([string]$executable, [string]$argument) {
+    $process = Start-Process -FilePath $executable -ArgumentList @($argument) -PassThru
+    try {
+        if (-not $process.WaitForExit(60000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "GUI smoke test timed out: $executable $argument"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "GUI smoke test returned $($process.ExitCode): $executable $argument"
+        }
+    }
+    finally { $process.Dispose() }
+}
+
 # An installed Windows Tesseract is required on the BUILD machine only.
 # End users receive a fully bundled copy.
 $tesseractDir = Join-Path $env:ProgramFiles 'Tesseract-OCR'
@@ -39,10 +55,8 @@ python -m PyInstaller --noconfirm --clean --windowed --onedir `
     --add-data 'vendor\tesseract;vendor\tesseract' main.py
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 $bundle = Join-Path $root 'dist\MangaOfflineTranslator\MangaOfflineTranslator.exe'
-& $bundle --self-test
-if ($LASTEXITCODE -ne 0) { throw 'Bundled executable self-test failed' }
-& $bundle --gui-self-test
-if ($LASTEXITCODE -ne 0) { throw 'Bundled Qt GUI smoke test failed' }
+Assert-GuiExecutable $bundle '--self-test'
+Assert-GuiExecutable $bundle '--gui-self-test'
 
 $iscc = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
@@ -59,16 +73,18 @@ Get-FileHash $setup.FullName -Algorithm SHA256
 # Exercise the *installer*, not only its unpacked PyInstaller executable.
 # Use a private directory in the ephemeral Windows build workspace.
 $installDir = Join-Path $root 'release\installed-smoke'
-& $setup.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
-if ($LASTEXITCODE -ne 0) { throw "Silent installer returned $LASTEXITCODE" }
+$installProcess = Start-Process -FilePath $setup.FullName -ArgumentList @(
+    '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir"
+) -PassThru -Wait
+if ($installProcess.ExitCode -ne 0) { throw "Silent installer returned $($installProcess.ExitCode)" }
 $installedExe = Join-Path $installDir 'MangaOfflineTranslator.exe'
 if (-not (Test-Path $installedExe)) { throw 'Installer did not install the executable' }
-& $installedExe --self-test
-if ($LASTEXITCODE -ne 0) { throw 'Installed OCR self-test failed' }
-& $installedExe --gui-self-test
-if ($LASTEXITCODE -ne 0) { throw 'Installed Qt GUI self-test failed' }
+Assert-GuiExecutable $installedExe '--self-test'
+Assert-GuiExecutable $installedExe '--gui-self-test' 
 $uninstallExe = Join-Path $installDir 'unins000.exe'
 if (-not (Test-Path $uninstallExe)) { throw 'Inno Setup uninstaller missing' }
-& $uninstallExe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-if ($LASTEXITCODE -ne 0) { throw 'Silent uninstaller failed' }
+$uninstallProcess = Start-Process -FilePath $uninstallExe -ArgumentList @(
+    '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+) -PassThru -Wait
+if ($uninstallProcess.ExitCode -ne 0) { throw 'Silent uninstaller failed' }
 Write-Host 'Installer smoke test: install, OCR, Qt GUI and uninstall succeeded.'

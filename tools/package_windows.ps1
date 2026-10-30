@@ -55,3 +55,20 @@ $setup = Get-ChildItem release\MangaOfflineTranslator_Setup_*_win64.exe | Select
 if (-not $setup) { throw 'Installer not created' }
 Write-Host "INSTALLER: $($setup.FullName)"
 Get-FileHash $setup.FullName -Algorithm SHA256
+
+# Exercise the *installer*, not only its unpacked PyInstaller executable.
+# Use a private directory in the ephemeral Windows build workspace.
+$installDir = Join-Path $root 'release\installed-smoke'
+& $setup.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
+if ($LASTEXITCODE -ne 0) { throw "Silent installer returned $LASTEXITCODE" }
+$installedExe = Join-Path $installDir 'MangaOfflineTranslator.exe'
+if (-not (Test-Path $installedExe)) { throw 'Installer did not install the executable' }
+& $installedExe --self-test
+if ($LASTEXITCODE -ne 0) { throw 'Installed OCR self-test failed' }
+& $installedExe --gui-self-test
+if ($LASTEXITCODE -ne 0) { throw 'Installed Qt GUI self-test failed' }
+$uninstallExe = Join-Path $installDir 'unins000.exe'
+if (-not (Test-Path $uninstallExe)) { throw 'Inno Setup uninstaller missing' }
+& $uninstallExe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+if ($LASTEXITCODE -ne 0) { throw 'Silent uninstaller failed' }
+Write-Host 'Installer smoke test: install, OCR, Qt GUI and uninstall succeeded.'

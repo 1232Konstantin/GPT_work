@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+release/
+vendor/
+*.pyc
+*.pyo
+*.spec
+assets/manga.ico

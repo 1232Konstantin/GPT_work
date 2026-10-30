@@ -1,0 +1,59 @@
+name: Windows installer
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install native build tools
+        shell: pwsh
+        run: |
+          choco install tesseract innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Chocolatey failed: $LASTEXITCODE" }
+      - name: Build, verify offline OCR, compile installer
+        shell: pwsh
+        run: ./tools/package_windows.ps1
+      - name: Upload installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MangaOfflineTranslator-Windows-Setup
+          path: release/MangaOfflineTranslator_Setup_*_win64.exe
+          if-no-files-found: error
+      - name: Publish GitHub Release when tagged
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_*_win64.exe | Select-Object -First 1
+          if (-not $setup) { throw 'No setup file for release' }
+          gh release create "${{ github.ref_name }}" $setup.FullName --title "Manga Offline Translator ${{ github.ref_name }}" --notes "Windows x64 installer with Qt, OCR engine and Japanese models. Offline after installation." --verify-tag
+      - name: Publish preview installer on main
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v0.3.0-preview.1'
+          $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_*_win64.exe | Select-Object -First 1
+          if (-not $setup) { throw 'No setup file for preview release' }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $setup.FullName --clobber
+          } else {
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.3 (preview)' --notes 'Experimental Windows x64 installer. Qt interface has not yet been manually validated on Windows. OCR runs locally; Japanese models included.' --prerelease
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Preview release publication failed' }

@@ -73,10 +73,7 @@ class PictureView(QGraphicsView):
             self.fit_picture()
 
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            super().wheelEvent(event)
-        else:
-            self.zoom(1.18 if event.angleDelta().y() > 0 else 1 / 1.18)
+        self.zoom(1.18 if event.angleDelta().y() > 0 else 1 / 1.18)
 
 
 class DuplicateDialog(QDialog):
@@ -115,7 +112,7 @@ class ViewerWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Manga Offline Translator  |  Библиотека изображений')
+        self.setWindowTitle('Manga Offline Translator — просмотр изображений')
         self.resize(1450, 910)
         self.setMinimumSize(850, 560)
         self.threadpool = QThreadPool.globalInstance()
@@ -167,9 +164,11 @@ class ViewerWindow(QMainWindow):
         toolbar = QToolBar('Инструменты')
         toolbar.setMovable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.addToolBar(toolbar)
+        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, toolbar)
         self._action(toolbar, '▣  Папка', self.choose_folder, 'Ctrl+O')
         self._action(toolbar, '＋  Файл', self.choose_file)
+        self._action(toolbar, '☷  Файлы', self.toggle_library, 'Ctrl+L')
+        self._action(toolbar, 'Дубликаты', self.find_duplicates, 'Ctrl+D')
         toolbar.addSeparator()
         self._action(toolbar, '←', lambda: self.move(-1), 'Left')
         self._action(toolbar, '→', lambda: self.move(1), 'Right')
@@ -185,11 +184,12 @@ class ViewerWindow(QMainWindow):
         main = QWidget()
         self.setCentralWidget(main)
         layout = QVBoxLayout(main)
-        layout.setContentsMargins(12, 12, 12, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         split = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(split, 1)
         left = QWidget()
+        self.library_panel = left
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 6, 0)
         heading = QLabel('БИБЛИОТЕКА')
@@ -236,11 +236,11 @@ class ViewerWindow(QMainWindow):
 
         viewer_panel = QWidget()
         rv = QVBoxLayout(viewer_panel)
-        rv.setContentsMargins(2, 0, 0, 0)
-        rv.setSpacing(8)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
         top = QHBoxLayout()
         self.title_label = QLabel('Выберите изображение')
-        self.title_label.setStyleSheet('font-size: 17px; font-weight:600;')
+        self.title_label.setStyleSheet('font-size: 13px; font-weight: 500; color: #d4dce7; padding: 6px 10px;')
         self.title_label.setMinimumWidth(150)
         top.addWidget(self.title_label, 1)
         self.image_info = QLabel('')
@@ -263,11 +263,20 @@ class ViewerWindow(QMainWindow):
             self.filmstrip.append(button)
             bottom.addWidget(button)
         bottom.addStretch(1)
+        # Win7-style viewer: no permanent filmstrip; picture occupies the canvas.
+        for button in self.filmstrip: button.hide()
+        self.counter_label.setText('')
         rv.addLayout(bottom)
         split.addWidget(left)
         split.addWidget(viewer_panel)
         split.setSizes([330, 1050])
+        self.library_panel.hide()   # Library appears only on user request.
         self._update_buttons()
+
+    def toggle_library(self):
+        self.library_panel.setVisible(not self.library_panel.isVisible())
+        if self.library_panel.isVisible():
+            self.list.setFocus()
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Открыть папку изображений')

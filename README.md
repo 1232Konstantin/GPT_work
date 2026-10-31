@@ -1,100 +1,37 @@
-# Manga Offline Translator 0.3 — Qt 6 desktop
+# Manga Offline Translator 0.4 (preview)
 
-**Статус:** исходный проект и автоматическая процедура выпуска Windows-установщика. **Windows EXE и установщик в текущем архиве отсутствуют.** Qt GUI в данной среде не был запущен (PySide6 не установлен, интернет недоступен). Это не проверенный Windows-релиз.
+Windows x64, fully offline viewer and manually guided manga translator. **Version 0.4 changes the editor workflow and intentionally disables full-page text detection** because it frequently marked irrelevant picture areas and missed Japanese text.
 
-## Возможности
+## Viewer: Windows 7 inspired
 
-### Основное окно — просмотрщик изображений
+- Picture occupies nearly the whole window by default. The small navigation toolbar is at the bottom.
+- `Ctrl+O` open folder; arrows previous / next; `R` / `Shift+R` rotate; `F` fit; `1` 100%; wheel zoom; mouse drag pan; `F11` fullscreen / `Esc` exit.
+- `Ctrl+L` toggles file/library panel. Search exact duplicate files/pixels via `Ctrl+D`; no automatic deletion. Show nested folders using the panel checkbox.
+- `Ctrl+E` opens the current page in the translator editor.
 
-- Современный тёмный интерфейс на **PySide6 / Qt 6** (вместо Tkinter), полноэкранный просмотр, навигация по папкам и изображениям, миниатюры, повороты только для отображения, масштабирование, перетаскивание, вписывание / 100%.
-- PNG, JPG/JPEG, WebP, BMP, TIFF, GIF; предварительный просмотр анимированных GIF — первого кадра.
-- Поиск **точных дубликатов** по декодированным RGBA-пикселям, включая вложенные папки и одинаковые изображения в файлах разных форматов. Отображение групп в отдельном диалоге, подсветка совпадений, фильтр дубликатов, отмена поиска. Файлы не удаляются.
-- Чтение файлов и поиск дубликатов работают в рабочих потоках, основные окна остаются отзывчивыми.
+## Editor: manual areas, local OCR
 
-### Отдельный редактор перевода одной страницы
+1. **Select text with the mouse:** the default tool creates a rectangle around the Japanese characters. The program will recognize only this selection, using bundled vertical/horizontal Japanese OCR, and suggest a text-placement boundary based on local balloon contours.
+2. **Adjust the boundary:** a red polygon shows the insertion boundary. Use **Edit red contour** and drag white handles; click a red edge to add a handle. Blue dashed rectangle = removal mask; yellow rectangles = OCR glyph/word candidates. If automatic geometry is wrong, choose **Contour → rectangle** and draw a new rectangular boundary. Use **Change cleaning area** to change only the removal rectangle.
+3. **Choose Translate, Hide, or Leave unchanged.** Edit the recognized text if OCR made mistakes, paste the translation, choose text color, font size (`0` = auto), bold or italic. Click **Apply changes**.
+4. View **Original / After cleaning / With translation** before exporting. Export the cleaned image separately or the translated one. PNG is lossless; JPEG quality=100 still has lossy compression. Original images are never overwritten.
+5. **Batch text exchange** retains `[0001]` style numbering for copying to an external translator and pasting back. It works on **one page** (the active editor).
+6. **Save project / Open project** allows resuming all areas, boundaries and translations.
 
-- Японский OCR через локальный Tesseract (`jpn` + `jpn_vert`).
-- Обязательная проверка всех найденных областей. Ручное создание областей и независимо задаваемые прямоугольники **очистки** и **размещения перевода**.
-- Действия с областью: **Перевести, Скрыть, Оставить**. Готовый перевод только для отмеченных «Перевести».
-- Копирование всех пронумерованных исходных строк и вставка переводов по `[0001]`, `[0002]`.
-- Фоновый предпросмотр: оригинал, очищенное изображение, результат с переводом. Сложные цветные фоны по-прежнему могут очищаться с артефактами.
-- Сохранение отдельного изображения с очисткой и финального изображения. PNG без потерь, JPEG с максимальным качеством **но с потерями**. Исходная картинка не перезаписывается.
-- Сохранение рабочего проекта `.json`, проверка несохранённых изменений.
+### Shortcuts
 
-## Управление просмотрщиком
+- `Ctrl+S` project save; `Ctrl+Z` / `Ctrl+Y` undo/redo; `Delete` remove selected area (when not typing); `Ctrl+C` copy OCR text; `Ctrl+V` paste translation; `Ctrl+T` bulk translations; `Ctrl+Enter` apply. Standard text-editor shortcuts work inside text fields.
 
-| Действие | Управление |
-|---|---|
-| Предыдущая / следующая картинка | `←` / `→` или кнопки |
-| Открыть папку | `Ctrl+O` |
-| Перевести текущую страницу | `Ctrl+E` |
-| Вписать | `F` |
-| 100% | `1` |
-| Повернуть по часовой / обратно | `R` / `Shift+R` |
-| Во весь экран | `F11`, выход `Esc` |
-| Масштаб | Колёсико мыши |
-| Панорамирование | Перетаскивание мышью |
+### Constraints
 
-## Запуск из исходников
+- No automatic offline slang translator is included: small local models do not reliably preserve Japanese slang and meaning, and large LLMs would substantially increase package size. External translator copy/paste and direct user translation remain supported.
+- OCR remains imperfect, even when limited to a manual area. Bounding boxes are **suggestions**; users can correct text and geometry. Automatic contour detection is conservative and can fall back to a rectangle. Complex textured backgrounds may show cleaning artifacts.
+- No network calls occur during use. Windows installer includes Python runtime, Qt, OpenCV, Tesseract and `jpn`/`jpn_vert` OCR language data. No separate installation is required.
 
-На Windows x64 установите Python 3.12, затем в каталоге проекта:
+## Development and release
 
-```bat
-py -m pip install -r requirements.txt
-py main.py
-```
+Requirements: Python 3.12, PySide6, Pillow, OpenCV, NumPy, pytesseract, pytest. To run source: `py -m pip install -r requirements.txt`, `py main.py`. Local OCR requires Tesseract + Japanese data.
 
-Для распознавания в режиме запуска **из исходников** Tesseract 5 должен быть установлен отдельно с `jpn`/`jpn_vert` (или располагаться в `vendor/tesseract`). Простой просмотр и поиск дубликатов не требуют OCR. **Опубликованный установщик должен включать движок и модели полностью**, без дополнительной установки пользователем.
+Workflow `.github/workflows/windows-release.yml` uses a hosted Windows VM to run tests, launch Qt windows in offscreen smoke mode, package PyInstaller, compile Inno Setup, **install the generated installer in a temporary location**, test OCR/Qt from installed EXE, uninstall, and publish a preview release. The release is a standard HTTPS download on GitHub, independent of ChatGPT.
 
-## Сборка Windows-установщика
-
-В Windows PowerShell с установленными Python 3.12, Inno Setup 6 и Tesseract OCR 5:
-
-```powershell
-./tools/package_windows.ps1
-```
-
-Сценарий:
-1. Копирует в проект `tesseract.exe`, DLL и комплект `tessdata` из системного Tesseract.
-2. При необходимости скачивает **только в момент сборки** официальные `jpn.traineddata` и `jpn_vert.traineddata`. Установленный продукт ничего не скачивает.
-3. Устанавливает зависимости, запускает `pytest`.
-4. Формирует папку `dist/MangaOfflineTranslator/` через PyInstaller.
-5. Выполняет `MangaOfflineTranslator.exe --self-test`, проверяя **обе** модели OCR.
-6. Создаёт установщик в `release/` через Inno Setup (папка программы, меню «Пуск», дополнительный ярлык на рабочем столе, деинсталляция).
-
-Готовый файл будет называться `MangaOfflineTranslator_Setup_0.3.0_win64.exe`.
-
-### Внешняя ссылка, не зависящая от ChatGPT
-
-В проекте включён `.github/workflows/windows-release.yml`. После размещения исходников в **вашем GitHub-репозитории**:
-
-- `workflow_dispatch` запускает Windows-сборку и сохраняет установщик как артефакт GitHub Actions.
-- Каждый коммит в `main` запускает Windows-сборку и после её успешного завершения публикует предварительный релиз `v0.3.0-preview.1`.
-- Тег вида `v0.3.0` запускает Windows-сборку и **при успешном завершении** публикует установщик в GitHub Releases. После этого он доступен по обычной публичной HTTPS-ссылке, без привязки к чату. Сам репозиторий для общедоступной прямой загрузки тоже должен быть публичным.
-
-**Пока этого релиза нет:** в среде подготовки исходников нет Windows и Inno Setup. Сборочный сценарий ещё не проверен на Windows, поэтому возможны доработки. Windows может показать SmartScreen-предупреждение для неподписанного EXE.
-
-## Разделение исходников
-
-- `main.py` — запуск Qt-приложения и проверка состава OCR-ресурсов (`--self-test`).
-- `qt_viewer.py` — просмотрщик, миниатюры, дубликаты и навигация.
-- `qt_editor.py` — OCR-редактор одной страницы, действия и проверка областей, нумерованный перевод, экспорт.
-- `qt_common.py` — тёмная тема, Qt/Pillow, фоновые задания.
-- `engine.py`, `viewer_core.py` — проверенные алгоритмы предыдущей версии, без сетевых вызовов.
-- `tests/` — тесты движка и дубликатов.
-- `installer/MangaOfflineTranslator.iss` — установка и удаление программы.
-- `.github/workflows/windows-release.yml` — Windows CI / публикация установщика.
-
-## Что нужно протестировать в следующем Windows-билде
-
-1. Запуск и визуальный рендеринг интерфейса Qt на Windows, включая окна редактора.
-2. Создание установщика на GitHub Actions и `--self-test` у упакованного EXE.
-3. Автоматический OCR на цветной манге; ручная корректировка областей, очистка фона и перенос длинного русского текста.
-4. Редактирование и сохранение черновика, обратное открытие проекта, предупреждение о несохранённых изменениях.
-5. Поиск точных дубликатов на большой папке с подпапками, отмена сканирования и переход к результатам.
-
-**Алгоритм очистки OpenCV не изменился относительно v0.2**: ложные области OCR могут испортить рисунок. Поэтому предварительная проверка обязательна, но это не гарантия идеального результата.
-
-## Размещение в GitHub
-
-Исходники размещаются в репозитории `1232Konstantin/GPT_work`. Для каждого изменения `main` GitHub Actions пытается собрать Windows-установщик, выполнить самопроверку и опубликовать preview-релиз. Не путайте предварительный релиз с проверенной стабильной сборкой.
+Files: `qt_viewer.py` picture-first viewer; `qt_editor.py` editor; `manual_regions.py` local OCR and contours; `engine.py` image processing; `viewer_core.py` exact duplicates; `main.py` entrypoint/tests. The project is work-in-progress and not digitally signed.

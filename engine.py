@@ -6,6 +6,7 @@ from pathlib import Path
 import os
 import re
 import sys
+import subprocess
 from typing import Iterable
 
 import cv2
@@ -29,6 +30,12 @@ class Region:
     action: str = 'translate'  # translate | hide | keep
     confirmed: bool = False  # User has checked this OCR area manually
     balloon: bool = False  # False = free-standing text, with no speech bubble
+    polygon: list[tuple[int,int]] = field(default_factory=list)  # editable red boundary
+    glyph_boxes: list[tuple[int,int,int,int]] = field(default_factory=list)
+    font_size: int = 0  # 0 = automatic
+    color: str = ''  # RGB hex, empty = automatic contrast
+    bold: bool = False
+    italic: bool = False
 
 
 @dataclass
@@ -72,7 +79,26 @@ def configure_ocr() -> tuple[str, set[str]]:
     tessdata = Path(engine).parent / 'tessdata'
     if tessdata.is_dir():
         os.environ['TESSDATA_PREFIX'] = str(tessdata)
-    langs = set(pytesseract.get_languages(config=''))
+    # Avoid Windows console flashes. Pytesseract's default STARTUPINFO does not
+    # always prevent the initial console window of tesseract.exe from appearing.
+    if os.name == 'nt':
+        pmod = pytesseract.pytesseract
+        if not getattr(pmod, '_manga_no_console', False):
+            old_args = pmod.subprocess_args
+            def hidden_args(*a, **kw):
+                options = old_args(*a, **kw)
+                options['creationflags'] = options.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW
+                return options
+            pmod.subprocess_args = hidden_args
+            pmod._manga_no_console = True
+    # Avoid spawning `tesseract --list-langs` just to find bundled models.
+    if tessdata.is_dir():
+        langs = {f.stem for f in tessdata.glob('*.traineddata')}
+    else:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        proc = subprocess.run([engine, '--list-langs'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, creationflags=flags, check=True)
+        langs = {line.strip() for line in proc.stdout.splitlines()[1:]}
     if not ({'jpn', 'jpn_vert'} & langs):
         raise RuntimeError('Не найдены языковые модели jpn.traineddata и/или jpn_vert.traineddata.')
     return engine, langs
@@ -504,17 +530,24 @@ def add_translations(cleaned: Image.Image, regions: Iterable[Region], font_path:
         x,y,w,h=clip_xywh(r.box,W,H)
         if w<3 or h<3:
             continue
-        # Balloon lettering is harmonised per page. Captions have their own size.
-        size=max(1,min(maxsize,preferred if r.balloon else round(maxsize*size_percent/100)))
+        size=(max(1,min(r.font_size,maxsize)) if r.font_size else
+              max(1,min(maxsize,preferred if r.balloon else round(maxsize*size_percent/100))))
+        # A manual font size is respected, but never allowed to overflow the box.
+        if r.font_size:
+            size=max(1,min(r.font_size,fitting_size(r.translated,(x,y,w,h),font_path,r.font_size)))
         lines=layout_text(r.translated,w,h,font_path,size)
         if lines is None:
             continue
         font=_font(font_path,size)
-        # Sample behind the text. Use light-on-dark / dark-on-light with fine outline.
         sample=np.asarray(image.crop((x,y,x+w,y+h)).convert('RGB'))
         light=float(np.median(sample[:,:,0]*.299+sample[:,:,1]*.587+sample[:,:,2]*.114))
         foreground=(0,0,0,255) if light>130 else (255,255,255,255)
-        outline=(255,255,255,210) if light>130 else (0,0,0,210)
+        if r.color:
+            try:
+                rgb=tuple(bytes.fromhex(r.color.lstrip('#')))
+                if len(rgb)==3: foreground=rgb+(255,)
+            except (ValueError,TypeError): pass
+        outline=(255,255,255,210) if sum(foreground[:3])<380 else (0,0,0,210)
         layer=Image.new('RGBA',(w,h),(0,0,0,0))
         draw=ImageDraw.Draw(layer)
         row_height=max(1,round(size*1.24))
@@ -522,7 +555,23 @@ def add_translations(cleaned: Image.Image, regions: Iterable[Region], font_path:
         for i,line in enumerate(lines):
             draw.text((w/2,top+i*row_height+row_height/2),line,font=font,
                       anchor='mm',align='center',fill=foreground,
-                      stroke_width=1 if size>=11 else 0, stroke_fill=outline)
+                      stroke_width=1 if size>=11 else 0,stroke_fill=outline)
+            if r.bold:
+                draw.text((w/2+max(1,size//15),top+i*row_height+row_height/2),line,font=font,
+                          anchor='mm',align='center',fill=foreground)
+        if r.italic:
+            skew=.17
+            neww=w+round(h*skew)
+            layer=layer.transform((neww,h),Image.Transform.AFFINE,(1,-skew,0,0,1,0),
+                                  resample=Image.Resampling.BICUBIC)
+            layer=layer.crop((0,0,w,h))
+        # Clip rendered text to the user's curvilinear translation boundary.
+        if len(r.polygon)>=3:
+            from PIL import ImageChops
+            poly=Image.new('L',(w,h),0)
+            coords=[(px-x,py-y) for px,py in r.polygon]
+            ImageDraw.Draw(poly).polygon(coords,fill=255)
+            layer.putalpha(ImageChops.multiply(layer.getchannel('A'),poly))
         image.alpha_composite(layer,(x,y))
     return image if cleaned.mode=='RGBA' else image.convert('RGB')
 

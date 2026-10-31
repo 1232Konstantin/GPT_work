@@ -65,3 +65,12 @@ class Task(QRunnable):
             self.signals.result.emit(self.fn(self.signals.progress.emit))
         except Exception as exc:
             self.signals.error.emit(f'{type(exc).__name__}: {exc}')
+
+# Compact control bar for the picture-first Win7-style viewer.
+STYLE += """
+QMainWindow QToolBar { background: #1d252f; border: none; border-top: 1px solid #39414e;
+ padding: 3px; spacing: 2px; }
+QMainWindow QToolBar QToolButton { padding: 5px 8px; margin: 1px; border-radius: 5px; }
+QGraphicsView { background: #111820; border: none; }
+QPlainTextEdit { selection-background-color: #376f9c; }
+"""

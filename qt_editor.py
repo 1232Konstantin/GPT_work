@@ -1,644 +1,495 @@
-"""Qt one-page translation editor. OCR regions require explicit user confirmation."""
+"""User-directed single-page translation studio: selection -> local OCR -> boundary -> preview."""
 from __future__ import annotations
-
 from copy import deepcopy
 import json
 from pathlib import Path
-
 from PIL import Image
-from PySide6.QtCore import Qt, Signal, QThreadPool, QRectF, QPointF
-from PySide6.QtGui import QAction, QPen, QColor, QBrush
+from PySide6.QtCore import Qt, Signal, QPointF, QRectF, QThreadPool
+from PySide6.QtGui import QAction, QColor, QPen, QBrush, QPainterPath, QFont, QKeySequence, QPainter
 from PySide6.QtWidgets import (QMainWindow, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QSplitter, QToolBar, QLabel, QGroupBox, QListWidget, QListWidgetItem,
-    QPushButton, QComboBox, QCheckBox, QPlainTextEdit, QFileDialog, QMessageBox,
-    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem, QFrame,
-    QSlider, QSpinBox, QProgressBar)
-
-from engine import (Page, Region, open_image, detect_regions, clip_xywh,
-    clean_image, add_translations, numbered_source, numbered_translations,
-    parse_numbered, to_json_pages, from_json_pages, save_image, default_font_path)
+    QSplitter, QLabel, QListWidget, QListWidgetItem, QPushButton, QComboBox, QCheckBox,
+    QPlainTextEdit, QFileDialog, QMessageBox, QGraphicsView, QGraphicsScene,
+    QFrame, QSpinBox, QProgressBar, QColorDialog, QApplication, QScrollArea,
+    QGraphicsItem, QButtonGroup)
+from engine import (Page, Region, open_image, clip_xywh, clean_image,
+    add_translations, numbered_source, numbered_translations, parse_numbered,
+    to_json_pages, from_json_pages, save_image, default_font_path)
+from manual_regions import suggest_boundary, inner_text_box, recognize_selection
 from qt_common import pixmap_from_pil, Task
 
 
-class RegionCanvas(QGraphicsView):
-    rect_drawn = Signal(object)
-    point_clicked = Signal(object)
+def boundary_rect(r):
+    x,y,w,h=r.box
+    return [(x,y),(x+w,y),(x+w,y+h),(x,y+h)]
 
+
+class Canvas(QGraphicsView):
+    rectangle_drawn=Signal(object)
+    clicked=Signal(object)
+    polygon_changed=Signal(object)
+    vertex_started=Signal()
+    vertex_inserted=Signal(object)
     def __init__(self):
         super().__init__()
-        self.setScene(QGraphicsScene(self))
-        self.setBackgroundBrush(QBrush(QColor('#0c121b')))
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setScene(QGraphicsScene(self)); self.setBackgroundBrush(QBrush(QColor('#10141a')))
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.fit = True
-        self.pen_items = []
-        self.tool = 'select'
-        self.drag_start: QPointF | None = None
-        self.temp = None
-
-    def set_picture(self, picture: Image.Image):
-        self.scene().clear()
-        self.scene().addPixmap(pixmap_from_pil(picture))
-        self.scene().setSceneRect(0, 0, picture.width, picture.height)
-        self.pen_items.clear()
-        if self.fit:
-            self.fit_picture()
-
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.tool='new'; self.fit=True; self.drag=None; self.temp=None
+        self.overlays=[]; self.points=[]; self.active_id=None; self.handle=-1;self.segments=[]
+    def set_picture(self,image):
+        z=self.transform()
+        self.scene().clear(); self.overlays=[]; self.points=[]; self.temp=None;self.segments=[]
+        self.scene().addPixmap(pixmap_from_pil(image))
+        self.scene().setSceneRect(0,0,image.width,image.height)
+        if self.fit: self.fit_picture()
+        else: self.setTransform(z)
     def fit_picture(self):
-        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        self.fit = True
-
-    def resizeEvent(self, event):
+        if self.scene().sceneRect().isEmpty(): return
+        self.fitInView(self.scene().sceneRect(),Qt.AspectRatioMode.KeepAspectRatio)
+        self.fit=True
+    def resizeEvent(self,event):
         super().resizeEvent(event)
-        if self.fit:
-            self.fit_picture()
-
-    def wheelEvent(self, event):
-        self.fit = False
-        factor = 1.18 if event.angleDelta().y() > 0 else 1/1.18
-        self.scale(factor, factor)
-
-    def set_tool(self, tool):
-        self.tool = tool
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if tool == 'pan'
-                         else QGraphicsView.DragMode.NoDrag)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.tool in ('new', 'ink', 'box'):
-            self.drag_start = self.mapToScene(event.position().toPoint())
-            pen = QPen(QColor('#62d5e9'), 2, Qt.PenStyle.DashLine)
-            self.temp = self.scene().addRect(QRectF(self.drag_start, self.drag_start), pen)
-            event.accept()
-            return
-        if event.button() == Qt.MouseButton.LeftButton and self.tool == 'select':
-            self.point_clicked.emit(self.mapToScene(event.position().toPoint()))
-            event.accept()
-            return
+        if self.fit: self.fit_picture()
+    def wheelEvent(self,event):
+        self.fit=False
+        self.scale(1.15 if event.angleDelta().y()>0 else 1/1.15,
+                   1.15 if event.angleDelta().y()>0 else 1/1.15)
+    def set_tool(self,tool):
+        self.tool=tool
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if tool=='pan' else QGraphicsView.DragMode.NoDrag)
+    def show_overlays(self,regions,selected,show=True):
+        for item in self.overlays:
+            if item.scene()==self.scene():self.scene().removeItem(item)
+        self.overlays=[]; self.points=[]; self.segments=[]; self.active_id=selected
+        if not show:return
+        for r in regions:
+            isactive=r.id==selected
+            # Dark-red polygon: translation boundary. Coral rectangles: OCR glyphs.
+            coords=r.polygon if len(r.polygon)>=3 else boundary_rect(r)
+            path=QPainterPath(QPointF(*coords[0]))
+            for p in coords[1:]:path.lineTo(*p)
+            path.closeSubpath()
+            outline=self.scene().addPath(path,QPen(QColor('#f06c70' if isactive else '#b65057'),
+                 2.7 if isactive else 1.3,Qt.PenStyle.SolidLine))
+            outline.setZValue(8);outline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.overlays.append(outline)
+            if isactive:
+                self.segments=[(i,QPointF(*coords[i]),QPointF(*coords[(i+1)%len(coords)])) for i in range(len(coords))]
+                for index,(x,y) in enumerate(coords):
+                    radius=5 / max(.4,self.transform().m11())
+                    dot=self.scene().addEllipse(x-radius,y-radius,radius*2,radius*2,
+                        QPen(QColor('#e94c5b'),1),QBrush(QColor('#ffffff')))
+                    dot.setZValue(22);dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self.overlays.append(dot);self.points.append((index,QPointF(x,y)))
+                for x,y,w,h in r.glyph_boxes:
+                    rect=self.scene().addRect(x,y,w,h,QPen(QColor('#ffe270'),1.4))
+                    rect.setZValue(13);rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self.overlays.append(rect)
+                x,y,w,h=r.ink
+                mark=self.scene().addRect(x,y,w,h,QPen(QColor('#63c9f0'),1,Qt.PenStyle.DashLine))
+                mark.setZValue(7);mark.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self.overlays.append(mark)
+            x,y,_,_=r.ink
+            label=self.scene().addText(str(r.id));label.setDefaultTextColor(QColor('#ffda9d'))
+            label.setPos(x,max(0,y-25));label.setZValue(18)
+            label.setAcceptedMouseButtons(Qt.MouseButton.NoButton);self.overlays.append(label)
+    def mousePressEvent(self,event):
+        if event.button()==Qt.MouseButton.LeftButton and self.tool in ('new','ink','rect'):
+            self.drag=self.mapToScene(event.position().toPoint())
+            self.temp=self.scene().addRect(QRectF(self.drag,self.drag),QPen(QColor('#69caf0'),2,Qt.PenStyle.DashLine))
+            event.accept();return
+        if event.button()==Qt.MouseButton.LeftButton and self.tool=='boundary':
+            pos=self.mapToScene(event.position().toPoint())
+            radius=12/max(.4,self.transform().m11())
+            candidate=[(i,(pt-pos).manhattanLength()) for i,pt in self.points if (pt-pos).manhattanLength()<radius]
+            if candidate:
+                self.handle=min(candidate,key=lambda t:t[1])[0]
+                self.vertex_started.emit()
+                event.accept();return
+            # Clicking directly on a red edge adds a new draggable vertex.
+            threshold=15/max(.4,self.transform().m11())
+            for i,a,b in self.segments:
+                ab=b-a; ap=pos-a
+                length=ab.x()*ab.x()+ab.y()*ab.y()
+                if length<.001:continue
+                t=max(0,min(1,(ap.x()*ab.x()+ap.y()*ab.y())/length))
+                nearest=a+ab*t
+                if (pos-nearest).manhattanLength()<threshold:
+                    self.vertex_inserted.emit((i+1,(round(pos.x()),round(pos.y()))))
+                    self.handle=i+1
+                    event.accept();return
+        if event.button()==Qt.MouseButton.LeftButton and self.tool=='select':
+            self.clicked.emit(self.mapToScene(event.position().toPoint()))
+            event.accept();return
         super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self.drag_start is not None and self.temp:
-            self.temp.setRect(QRectF(self.drag_start, self.mapToScene(event.position().toPoint())).normalized())
-            event.accept()
-            return
+    def mouseMoveEvent(self,event):
+        if self.drag is not None and self.temp is not None:
+            self.temp.setRect(QRectF(self.drag,self.mapToScene(event.position().toPoint())).normalized())
+            event.accept();return
+        if self.handle>=0:
+            pos=self.mapToScene(event.position().toPoint())
+            self.polygon_changed.emit((self.handle,(round(pos.x()),round(pos.y())),False))
+            event.accept();return
         super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self.drag_start is not None:
-            rect = QRectF(self.drag_start, self.mapToScene(event.position().toPoint())).normalized()
-            self.drag_start = None
-            if self.temp:
-                self.scene().removeItem(self.temp)
-                self.temp = None
-            if rect.width() >= 4 and rect.height() >= 4:
-                self.rect_drawn.emit((round(rect.x()), round(rect.y()),
-                                      round(rect.width()), round(rect.height())))
-            event.accept()
-            return
+    def mouseReleaseEvent(self,event):
+        if self.drag is not None:
+            rect=QRectF(self.drag,self.mapToScene(event.position().toPoint())).normalized()
+            self.drag=None
+            if self.temp is not None:
+                self.scene().removeItem(self.temp);self.temp=None
+            if rect.width()>5 and rect.height()>5:
+                self.rectangle_drawn.emit((round(rect.x()),round(rect.y()),round(rect.width()),round(rect.height())))
+            event.accept();return
+        if self.handle>=0:
+            pos=self.mapToScene(event.position().toPoint())
+            self.polygon_changed.emit((self.handle,(round(pos.x()),round(pos.y())),True))
+            self.handle=-1;event.accept();return
         super().mouseReleaseEvent(event)
 
-    def show_regions(self, regions, selected_id, enabled=True):
-        for item in self.pen_items:
-            if item.scene() is self.scene():
-                self.scene().removeItem(item)
-        self.pen_items.clear()
-        if not enabled:
-            return
-        for r in regions:
-            chosen = r.id == selected_id
-            for box, color, style in ((r.ink, '#ff8585', Qt.PenStyle.SolidLine),
-                                      (r.box, '#64dfb0', Qt.PenStyle.DashLine)):
-                pen = QPen(QColor(color if r.confirmed else '#fbc66a'), 2.5 if chosen else 1.5, style)
-                item = self.scene().addRect(QRectF(*box), pen)
-                item.setZValue(10)
-                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                self.pen_items.append(item)
-            x, y, _, _ = r.ink
-            label = self.scene().addText(f'{r.id} {"✓" if r.confirmed else "!"}')
-            label.setDefaultTextColor(QColor('#a8f3e0' if r.confirmed else '#ffd28c'))
-            label.setPos(x, max(0, y-25))
-            label.setZValue(11)
-            label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self.pen_items.append(label)
 
-
-class TranslationDialog(QDialog):
-    def __init__(self, page: Page, on_apply, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle('Обмен переводами · номера сохраняются')
-        self.resize(1080, 660)
-        self.page = page
-        self.on_apply = on_apply
-        layout = QVBoxLayout(self)
-        hint = QLabel('Скопируйте исходные строки, переведите любым способом и вставьте справа. '
-                      'Номера вида [0001] должны сохраниться.')
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        texts = QHBoxLayout()
-        left = QVBoxLayout()
-        left.addWidget(QLabel('Японский оригинал'))
-        self.source = QPlainTextEdit(numbered_source([page]))
-        self.source.setReadOnly(True)
-        left.addWidget(self.source)
-        right = QVBoxLayout()
-        right.addWidget(QLabel('Русский / английский перевод'))
-        self.target = QPlainTextEdit(numbered_translations([page]))
-        right.addWidget(self.target)
-        texts.addLayout(left, 1)
-        texts.addLayout(right, 1)
-        layout.addLayout(texts, 1)
-        buttons = QHBoxLayout()
-        copy = QPushButton('Копировать оригинал')
-        copy.clicked.connect(lambda: self.source.selectAll() or self.source.copy())
-        paste = QPushButton('Вставить перевод')
-        paste.clicked.connect(self.target.paste)
-        save = QPushButton('Применить переводы')
-        save.setProperty('primary', True)
-        save.clicked.connect(self.apply)
-        buttons.addWidget(copy)
-        buttons.addWidget(paste)
-        buttons.addStretch()
-        buttons.addWidget(save)
-        layout.addLayout(buttons)
-
+class ExchangeDialog(QDialog):
+    def __init__(self,page,apply,parent=None):
+        super().__init__(parent);self.page=page;self.apply_callback=apply
+        self.setWindowTitle('Перевести сразу несколько надписей');self.resize(1000,570)
+        root=QVBoxLayout(self)
+        label=QLabel('Скопируйте текст слева, переведите удобным способом и вставьте справа. Сохраните номера [0001], [0002]…')
+        label.setWordWrap(True);root.addWidget(label)
+        row=QHBoxLayout();root.addLayout(row,1)
+        for text,attr,editable in [('Оригинальный японский текст','source',False),('Перевод · русский или английский','target',True)]:
+            column=QVBoxLayout();column.addWidget(QLabel(text));field=QPlainTextEdit();field.setReadOnly(not editable)
+            field.setPlainText(numbered_translations([page]) if editable else numbered_source([page]))
+            column.addWidget(field);row.addLayout(column,1);setattr(self,attr,field)
+        controls=QHBoxLayout();root.addLayout(controls)
+        a=QPushButton('Скопировать оригинал');a.clicked.connect(lambda:QApplication.clipboard().setText(self.source.toPlainText()))
+        b=QPushButton('Вставить из буфера');b.clicked.connect(self.target.paste)
+        c=QPushButton('Применить перевод');c.setProperty('primary',True);c.clicked.connect(self.apply)
+        controls.addWidget(a);controls.addWidget(b);controls.addStretch();controls.addWidget(c)
     def apply(self):
         try:
-            parsed = parse_numbered(self.target.toPlainText())
-            expected = {r.id for r in self.page.regions if r.action == 'translate'}
-            unknown = set(parsed) - expected
-            if unknown:
-                raise ValueError('Неизвестные номера: ' + ', '.join(map(str, sorted(unknown))))
-            missing = expected - set(parsed)
-            if missing and QMessageBox.question(self, 'Неполный перевод',
-                f'Отсутствуют {len(missing)} переводов. Сохранить прежний текст для них?') != QMessageBox.StandardButton.Yes:
-                return
-            self.on_apply(parsed)
-            self.accept()
-        except ValueError as exc:
-            QMessageBox.warning(self, 'Ошибка нумерации', str(exc))
+            values=parse_numbered(self.target.toPlainText());valid={r.id for r in self.page.regions if r.action=='translate'}
+            if set(values)-valid: raise ValueError('Неизвестный номер надписи')
+            self.apply_callback(values);self.accept()
+        except ValueError as e:QMessageBox.warning(self,'Ошибка нумерации',str(e))
 
 
 class EditorWindow(QMainWindow):
-    def __init__(self, image_path: Path):
-        super().__init__()
-        self.path = Path(image_path).resolve()
-        self.page = Page(str(self.path))
-        self.original = open_image(str(self.path))
-        self.selected_id = None
-        self.dirty = False
-        self.project_path: Path | None = None
-        self.preview_generation = 0
-        self.ocr_generation = 0
-        self.pending: set[Task] = set()
-        self.busy = False
-        self.font_path = default_font_path()
-        self._loading_form = False
-        self._build_ui()
-        self.canvas.set_picture(self.original)
-        self.refresh_regions()
-        self._title()
-        self.statusBar().showMessage('Распознайте текст, затем проверьте каждую область.')
-
-    def task(self, function, callback, error=None):
-        job = Task(function)
-        self.pending.add(job)
-        def done(result):
-            self.pending.discard(job)
-            callback(result)
-        def failed(message):
-            self.pending.discard(job)
-            (error or self._error)(message)
-        job.signals.result.connect(done)
-        job.signals.error.connect(failed)
-        QThreadPool.globalInstance().start(job)
-
-    def _error(self, text):
-        self.busy = False
-        self.progress.setVisible(False)
-        QMessageBox.warning(self, 'Не удалось выполнить операцию', text)
-        self.statusBar().showMessage(text, 10000)
-
-    def _title(self):
-        mark = ' *' if self.dirty else ''
-        self.setWindowTitle(f'Редактор перевода  |  {self.path.name}{mark}')
-
-    def mark_dirty(self):
-        self.dirty = True
-        self._title()
-
-    def _act(self, bar, title, callback, shortcut=None):
-        action = QAction(title, self)
-        action.triggered.connect(callback)
-        if shortcut:
-            action.setShortcut(shortcut)
-        bar.addAction(action)
-        return action
-
+    def __init__(self,image_path:Path):
+        super().__init__();self.path=Path(image_path).resolve();self.page=Page(str(self.path))
+        self.original=open_image(str(self.path));self.selected_id=None;self.project_path=None
+        self.dirty=False;self._loading=False;self.pending=set();self.preview_number=0
+        self.ocr_number=0;self.history=[];self.redo_stack=[];self.font_path=default_font_path()
+        self._build_ui();self.canvas.set_picture(self.original);self.refresh_list()
+        self.statusBar().showMessage('1. Выделите надпись мышью → 2. Исправьте контур → 3. Введите перевод.')
     def _build_ui(self):
-        self.resize(1480, 920)
-        toolbar = QToolBar('Редактор')
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-        self._act(toolbar, '◎  Распознать OCR', self.recognize)
-        self._act(toolbar, '≡  Строки перевода', self.exchange, 'Ctrl+T')
-        toolbar.addSeparator()
-        self._act(toolbar, '◧  Сохранить очищенное', lambda: self.export('clean'))
-        self._act(toolbar, '▣  Сохранить перевод', lambda: self.export('translated'))
-        toolbar.addSeparator()
-        self._act(toolbar, 'Сохранить проект', self.save_project, 'Ctrl+S')
-        self._act(toolbar, 'Открыть проект', self.load_project)
-
-        main = QWidget()
-        self.setCentralWidget(main)
-        outer = QVBoxLayout(main)
-        outer.setContentsMargins(12, 10, 12, 10)
-        outer.setSpacing(8)
-        split = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(split)
-        central = QWidget()
-        cv = QVBoxLayout(central)
-        cv.setContentsMargins(0, 0, 7, 0)
-        top = QHBoxLayout()
-        title = QLabel(self.path.name)
-        title.setStyleSheet('font-size:17px; font-weight:650;')
-        top.addWidget(title, 1)
-        self.mode = QComboBox()
-        self.mode.addItems(['Оригинал', 'Очищено', 'Перевод'])
-        self.mode.currentIndexChanged.connect(self.refresh_preview)
-        top.addWidget(self.mode)
-        fit = QPushButton('Вписать')
-        fit.clicked.connect(self.canvas_fit)
-        top.addWidget(fit)
-        self.bounds = QCheckBox('Области')
-        self.bounds.setChecked(True)
-        self.bounds.toggled.connect(self.paint_overlays)
-        top.addWidget(self.bounds)
-        cv.addLayout(top)
-        self.canvas = RegionCanvas()
-        self.canvas.rect_drawn.connect(self.draw_rect)
-        self.canvas.point_clicked.connect(self.hit_test)
-        self.canvas.setFrameShape(QFrame.Shape.NoFrame)
-        cv.addWidget(self.canvas, 1)
-        help_label = QLabel('Красный: область стирания · Зелёный: зона перевода · Жёлтый: не подтверждено · Колёсико: масштаб')
-        help_label.setProperty('muted', True)
-        cv.addWidget(help_label)
-        split.addWidget(central)
-
-        side = QWidget()
-        side.setMinimumWidth(330)
-        sv = QVBoxLayout(side)
-        sv.setContentsMargins(5, 0, 0, 0)
-        sv.setSpacing(8)
-        heading = QLabel('ОБЛАСТИ ТЕКСТА')
-        heading.setStyleSheet('font-weight:700; letter-spacing:2px; color:#97a9bf;')
-        sv.addWidget(heading)
-        self.regions = QListWidget()
-        self.regions.setMaximumHeight(220)
-        self.regions.currentRowChanged.connect(self.region_chosen)
-        sv.addWidget(self.regions)
-        tools = QGroupBox('Инструмент на изображении')
-        tl = QVBoxLayout(tools)
-        self.tool = QComboBox()
-        self.tool.addItem('Выбрать область', 'select')
-        self.tool.addItem('Добавить область', 'new')
-        self.tool.addItem('Изменить стирание (красная)', 'ink')
-        self.tool.addItem('Изменить размещение (зелёная)', 'box')
-        self.tool.addItem('Перемещать изображение', 'pan')
-        self.tool.currentIndexChanged.connect(lambda _: self.canvas.set_tool(self.tool.currentData()))
-        tl.addWidget(self.tool)
-        sv.addWidget(tools)
-        fields = QGroupBox('Содержимое выделенной области')
-        form = QVBoxLayout(fields)
-        self.action = QComboBox()
-        self.action.addItem('Перевести', 'translate')
-        self.action.addItem('Скрыть', 'hide')
-        self.action.addItem('Оставить', 'keep')
-        form.addWidget(QLabel('Что сделать с надписью'))
-        form.addWidget(self.action)
-        self.balloon = QCheckBox('Внутри облачка (автоподбор шрифта)')
-        form.addWidget(self.balloon)
-        form.addWidget(QLabel('Распознанный текст (можно исправить)'))
-        self.source = QPlainTextEdit()
-        self.source.setMaximumHeight(84)
-        form.addWidget(self.source)
-        form.addWidget(QLabel('Перевод'))
-        self.translated = QPlainTextEdit()
-        self.translated.setMaximumHeight(110)
-        form.addWidget(self.translated)
-        self.apply = QPushButton('✓  Применить и подтвердить')
-        self.apply.setProperty('primary', True)
-        self.apply.clicked.connect(self.confirm_region)
-        form.addWidget(self.apply)
-        delete = QPushButton('Удалить область')
-        delete.clicked.connect(self.remove_region)
-        form.addWidget(delete)
-        sv.addWidget(fields)
-        settings = QGroupBox('Параметры обработки')
-        fl = QFormLayout(settings)
-        self.ocr_dir = QComboBox()
-        self.ocr_dir.addItem('Японский — оба направления', 'both')
-        self.ocr_dir.addItem('Вертикальный', 'vertical')
-        self.ocr_dir.addItem('Горизонтальный', 'horizontal')
-        fl.addRow('OCR', self.ocr_dir)
-        self.strength = QSpinBox()
-        self.strength.setRange(0, 100)
-        self.strength.setValue(60)
-        self.strength.valueChanged.connect(self.refresh_preview)
-        fl.addRow('Очистка, %', self.strength)
-        self.font_percent = QSpinBox()
-        self.font_percent.setRange(50, 160)
-        self.font_percent.setSingleStep(5)
-        self.font_percent.setValue(100)
-        self.font_percent.valueChanged.connect(self.refresh_preview)
-        fl.addRow('Шрифт, %', self.font_percent)
-        sv.addWidget(settings)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.setVisible(False)
-        sv.addWidget(self.progress)
-        sv.addStretch(1)
-        split.addWidget(side)
-        split.setSizes([1040, 390])
-
-    def canvas_fit(self):
-        self.canvas.fit_picture()
-
-    def _region(self):
-        return next((r for r in self.page.regions if r.id == self.selected_id), None)
-
-    def store_draft(self):
-        r = self._region()
-        if r is None or self._loading_form:
-            return
-        data = (self.source.toPlainText(), self.translated.toPlainText(),
-                self.action.currentData(), self.balloon.isChecked())
-        if data != (r.source, r.translated, r.action, r.balloon):
-            r.source, r.translated, r.action, r.balloon = data
-            r.confirmed = False
-            self.mark_dirty()
-
-    def region_chosen(self, row):
-        self.store_draft()
-        self.selected_id = self.page.regions[row].id if 0 <= row < len(self.page.regions) else None
-        r = self._region()
-        self._loading_form = True
-        self.source.setPlainText(r.source if r else '')
-        self.translated.setPlainText(r.translated if r else '')
-        self.action.setCurrentIndex(next((i for i in range(self.action.count())
-            if self.action.itemData(i) == (r.action if r else 'translate')), 0))
-        self.balloon.setChecked(r.balloon if r else False)
-        self._loading_form = False
-        self.paint_overlays()
-
-    def select_region(self, rid):
-        for idx, r in enumerate(self.page.regions):
-            if r.id == rid:
-                self.regions.setCurrentRow(idx)
-                return
-
-    def refresh_regions(self):
-        self.regions.blockSignals(True)
-        self.regions.clear()
+        self.resize(1470,920);self.setWindowTitle('Перевод страницы — '+self.path.name)
+        outer=QWidget();self.setCentralWidget(outer);layout=QVBoxLayout(outer)
+        layout.setContentsMargins(8,8,8,5);layout.setSpacing(7)
+        top=QHBoxLayout();layout.addLayout(top)
+        title=QLabel('Перевод страницы');title.setStyleSheet('font-size:19px;font-weight:650')
+        top.addWidget(title);top.addStretch()
+        def button(text,func,primary=False):
+            b=QPushButton(text);b.clicked.connect(func)
+            if primary:b.setProperty('primary',True)
+            top.addWidget(b);return b
+        button('↶ Отменить',self.undo);button('↷ Повторить',self.redo)
+        button('Сохранить проект',self.save_project)
+        button('Открыть проект',self.load_project)
+        button('Экспорт очищенного',lambda:self.export('clean'))
+        button('Экспорт перевода',lambda:self.export('translated'),True)
+        split=QSplitter(Qt.Orientation.Horizontal);layout.addWidget(split,1)
+        visual=QWidget();vl=QVBoxLayout(visual);vl.setContentsMargins(0,0,0,0)
+        instructions=QLabel('Выделите текст прямоугольником · красная линия — зона перевода · жёлтые рамки — распознанные слова')
+        instructions.setProperty('muted',True);vl.addWidget(instructions)
+        self.canvas=Canvas();self.canvas.rectangle_drawn.connect(self.draw_rect)
+        self.canvas.clicked.connect(self.hit_test);self.canvas.polygon_changed.connect(self.move_vertex)
+        self.canvas.vertex_started.connect(self.checkpoint)
+        self.canvas.vertex_inserted.connect(self.insert_vertex)
+        vl.addWidget(self.canvas,1)
+        bottom=QHBoxLayout();vl.addLayout(bottom)
+        self.tool=QComboBox()
+        for label,key in [('＋ Выделить надпись','new'),('Выбрать','select'),('Изменять красный контур','boundary'),
+                          ('Задать прямоугольный контур','rect'),('Изменить область очистки','ink'),('Перемещать','pan')]:
+            self.tool.addItem(label,key)
+        self.tool.currentIndexChanged.connect(lambda _:self.canvas.set_tool(self.tool.currentData()))
+        bottom.addWidget(self.tool)
+        self.mode=QComboBox();self.mode.addItems(['Оригинал','После очистки','С переводом'])
+        self.mode.currentIndexChanged.connect(self.preview);bottom.addWidget(self.mode)
+        fit=QPushButton('Вписать в окно');fit.clicked.connect(self.canvas.fit_picture);bottom.addWidget(fit)
+        self.show_boxes=QCheckBox('Показать границы');self.show_boxes.setChecked(True)
+        self.show_boxes.toggled.connect(self.paint);bottom.addWidget(self.show_boxes)
+        split.addWidget(visual)
+        sidebar=QWidget();sidebar.setMinimumWidth(360);sidebar.setMaximumWidth(480)
+        side=QVBoxLayout(sidebar);side.setContentsMargins(6,0,3,0);side.setSpacing(7)
+        side.addWidget(QLabel('НАДПИСИ НА СТРАНИЦЕ'))
+        self.regions=QListWidget();self.regions.setMaximumHeight(155)
+        self.regions.currentRowChanged.connect(self.region_chosen);side.addWidget(self.regions)
+        a=QHBoxLayout();side.addLayout(a)
+        delbtn=QPushButton('Удалить область');delbtn.clicked.connect(self.remove_region);a.addWidget(delbtn)
+        resetbtn=QPushButton('Контур → прямоугольник');resetbtn.clicked.connect(self.reset_boundary);a.addWidget(resetbtn)
+        side.addWidget(QLabel('Оригинальная надпись (OCR, можно исправить)'))
+        self.source=QPlainTextEdit();self.source.setMaximumHeight(90);side.addWidget(self.source)
+        opts=QHBoxLayout();side.addLayout(opts)
+        self.ocr_dir=QComboBox()
+        for title,key in [('Японский: авто','both'),('Вертикальный','vertical'),('Горизонтальный','horizontal')]:self.ocr_dir.addItem(title,key)
+        opts.addWidget(self.ocr_dir)
+        reocr=QPushButton('Повторить OCR выделения');reocr.clicked.connect(self.recognize_selected);opts.addWidget(reocr)
+        side.addWidget(QLabel('Что сделать с надписью'))
+        self.action=QComboBox()
+        for label,value in [('Заменить переводом','translate'),('Только скрыть','hide'),('Оставить как есть','keep')]:
+            self.action.addItem(label,value)
+        side.addWidget(self.action)
+        side.addWidget(QLabel('Новый текст (русский / английский)'))
+        self.target=QPlainTextEdit();self.target.setMaximumHeight(120);side.addWidget(self.target)
+        fontrow=QHBoxLayout();side.addLayout(fontrow)
+        fontrow.addWidget(QLabel('Размер:'))
+        self.font=QSpinBox();self.font.setRange(0,180);self.font.setSpecialValueText('Авто');fontrow.addWidget(self.font)
+        self.bold=QCheckBox('Ж');fontrow.addWidget(self.bold)
+        self.italic=QCheckBox('Курсив');fontrow.addWidget(self.italic)
+        self.font_color=''
+        self.color_btn=QPushButton('Цвет текста');self.color_btn.clicked.connect(self.choose_color)
+        fontrow.addWidget(self.color_btn)
+        self.strength=QSpinBox();self.strength.setRange(0,100);self.strength.setValue(60)
+        settings=QHBoxLayout();side.addLayout(settings)
+        settings.addWidget(QLabel('Очистка, %'));settings.addWidget(self.strength)
+        settings.addWidget(QLabel('0 = авто размер шрифта'))
+        apply=QPushButton('Применить изменения · Ctrl+Enter');apply.setProperty('primary',True)
+        apply.clicked.connect(self.commit);side.addWidget(apply)
+        batch=QPushButton('Скопировать / вставить переводы по номерам');batch.clicked.connect(self.exchange)
+        side.addWidget(batch)
+        self.progress=QProgressBar();self.progress.setRange(0,0);self.progress.hide();side.addWidget(self.progress)
+        side.addStretch(1)
+        split.addWidget(sidebar);split.setSizes([1040,420])
+        for shortcut,func in [('Ctrl+S',self.save_project),('Ctrl+Z',self.undo),('Ctrl+Y',self.redo),
+                              ('Ctrl+Shift+Z',self.redo),('Delete',self.delete_shortcut),
+                              ('Ctrl+Return',self.commit),('Ctrl+T',self.exchange),('Ctrl+C',self.copy_selected),
+                              ('Ctrl+V',self.paste_selected)]:
+            act=QAction(self);act.setShortcut(QKeySequence(shortcut));act.triggered.connect(func);self.addAction(act)
+    def _field_focus(self):
+        focus=QApplication.focusWidget()
+        return isinstance(focus,QPlainTextEdit)
+    def copy_selected(self):
+        if self._field_focus():
+            QApplication.focusWidget().copy();return
+        r=self.selected();
+        if r:QApplication.clipboard().setText(r.source)
+    def paste_selected(self):
+        if self._field_focus():
+            QApplication.focusWidget().paste();return
+        r=self.selected()
+        if r:self.target.setPlainText(QApplication.clipboard().text());self.commit()
+    def delete_shortcut(self):
+        if self._field_focus():return
+        self.remove_region()
+    def task(self,fn,done):
+        task=Task(fn);self.pending.add(task)
+        def ready(result):self.pending.discard(task);done(result)
+        def failed(message):
+            self.pending.discard(task);self.progress.hide();QMessageBox.warning(self,'Ошибка обработки',message)
+        task.signals.result.connect(ready);task.signals.error.connect(failed)
+        QThreadPool.globalInstance().start(task)
+    def selected(self):return next((r for r in self.page.regions if r.id==self.selected_id),None)
+    def checkpoint(self):
+        self.history.append(deepcopy(self.page.regions))
+        if len(self.history)>70:self.history.pop(0)
+        self.redo_stack.clear();self.dirty=True;self.setWindowTitle('* Перевод — '+self.path.name)
+    def undo(self):
+        if self._field_focus() and QApplication.focusWidget().document().isUndoAvailable():
+            QApplication.focusWidget().undo();return
+        if not self.history:return
+        self.redo_stack.append(deepcopy(self.page.regions));self.page.regions=self.history.pop()
+        self.selected_id=None;self.refresh_list();self.preview()
+    def redo(self):
+        if not self.redo_stack:return
+        self.history.append(deepcopy(self.page.regions));self.page.regions=self.redo_stack.pop()
+        self.selected_id=None;self.refresh_list();self.preview()
+    def refresh_list(self):
+        self.regions.blockSignals(True);self.regions.clear()
         for r in self.page.regions:
-            prefix = '✓' if r.confirmed else '!'
-            type_ = {'translate':'Перевести','hide':'Скрыть','keep':'Оставить'}.get(r.action, '?')
-            item = QListWidgetItem(f'{prefix}   {r.id:04d}  · {type_}  · {r.source[:24]}')
-            item.setForeground(QColor('#a4ebd1' if r.confirmed else '#ffd292'))
-            self.regions.addItem(item)
-        index = next((n for n, r in enumerate(self.page.regions) if r.id == self.selected_id), -1)
-        self.regions.setCurrentRow(index)
-        self.regions.blockSignals(False)
-        self.paint_overlays()
-
-    def paint_overlays(self):
-        self.canvas.show_regions(self.page.regions, self.selected_id, self.bounds.isChecked())
-
-    def hit_test(self, point):
-        x, y = point.x(), point.y()
-        candidates = [r for r in self.page.regions if any(
-            rx <= x <= rx+rw and ry <= y <= ry+rh for rx, ry, rw, rh in (r.ink, r.box))]
-        if candidates:
-            self.select_region(min(candidates, key=lambda r: r.box[2]*r.box[3]).id)
-
-    def draw_rect(self, bounds):
-        tool = self.tool.currentData()
-        rect = clip_xywh(bounds, self.original.width, self.original.height)
-        if rect[2] < 4 or rect[3] < 4:
-            return
-        self.store_draft()
-        if tool == 'new':
-            rid = max((r.id for r in self.page.regions), default=0)+1
-            self.page.regions.append(Region(rid, rect, rect, orientation='manual'))
-            self.selected_id = None
+            label={'translate':'Перевести','hide':'Скрыть','keep':'Оставить'}[r.action]
+            self.regions.addItem(QListWidgetItem(f'#{r.id}  · {label}   {r.source[:22] or "(распознавание…)"}'))
+        row=next((i for i,r in enumerate(self.page.regions) if r.id==self.selected_id),-1)
+        self.regions.setCurrentRow(row);self.regions.blockSignals(False)
+        self.fill_form();self.paint()
+    def fill_form(self):
+        self._loading=True;r=self.selected()
+        self.source.setPlainText(r.source if r else '')
+        self.target.setPlainText(r.translated if r else '')
+        for i in range(self.action.count()):
+            if self.action.itemData(i)==(r.action if r else 'translate'):self.action.setCurrentIndex(i)
+        self.font.setValue(r.font_size if r else 0)
+        self.bold.setChecked(bool(r and r.bold));self.italic.setChecked(bool(r and r.italic))
+        self.font_color=r.color if r else ''
+        self.color_btn.setStyleSheet('border: 2px solid '+r.color if r and r.color else '')
+        self._loading=False
+    def region_chosen(self,row):
+        # Auto-save editing when changing selections, but not programmatic refreshes.
+        if not self._loading:self.store_form()
+        self.selected_id=self.page.regions[row].id if 0<=row<len(self.page.regions) else None
+        self.fill_form();self.paint()
+    def store_form(self):
+        r=self.selected()
+        if not r or self._loading:return
+        new=(self.source.toPlainText(),self.target.toPlainText(),self.action.currentData(),
+             self.font.value(),self.font_color,self.bold.isChecked(),self.italic.isChecked())
+        old=(r.source,r.translated,r.action,r.font_size,r.color,r.bold,r.italic)
+        if new!=old:
+            self.checkpoint();(r.source,r.translated,r.action,r.font_size,r.color,r.bold,r.italic)=new
+            r.confirmed=True
+    def commit(self):self.store_form();self.refresh_list();self.preview()
+    def choose_color(self):
+        c=QColorDialog.getColor(QColor(self.font_color or '#222222'),self,'Цвет текста')
+        if c.isValid():self.font_color=c.name();self.color_btn.setStyleSheet('border: 2px solid '+c.name())
+    def hit_test(self,p):
+        for r in reversed(self.page.regions):
+            x,y,w,h=r.box
+            if x<=p.x()<=x+w and y<=p.y()<=y+h:
+                for i,item in enumerate(self.page.regions):
+                    if item.id==r.id:self.regions.setCurrentRow(i);return
+    def paint(self):self.canvas.show_overlays(self.page.regions,self.selected_id,self.show_boxes.isChecked())
+    def choose_tool(self,key):
+        for i in range(self.tool.count()):
+            if self.tool.itemData(i)==key:self.tool.setCurrentIndex(i);return
+    def draw_rect(self,bounds):
+        rect=clip_xywh(bounds,*self.original.size)
+        if rect[2]<6 or rect[3]<6:return
+        self.store_form();mode=self.tool.currentData()
+        if mode=='new':
+            self.checkpoint();rid=max([r.id for r in self.page.regions],default=0)+1
+            r=Region(rid,rect,rect,orientation='manual');self.page.regions.append(r)
+            self.selected_id=rid;self.refresh_list();self.progress.show()
+            original=self.original.copy();direction=self.ocr_dir.currentData()
+            def work(_):return suggest_boundary(original,rect),recognize_selection(original,rect,direction)
+            def ready(result):
+                self.progress.hide()
+                current=next((r for r in self.page.regions if r.id==rid),None)
+                if not current:return
+                polygon,ocr=result
+                current.polygon=polygon
+                if polygon:
+                    current.box=inner_text_box(polygon,rect,self.original.size)
+                    current.balloon=True
+                current.source=ocr.text;current.confidence=ocr.confidence
+                current.orientation=ocr.orientation;current.glyph_boxes=ocr.glyph_boxes
+                self.refresh_list();self.preview()
+                self.statusBar().showMessage('OCR — подсказка: исправьте при необходимости. Красные точки перетаскиваются в режиме «контур».',10000)
+            self.task(work,ready)
         else:
-            r = self._region()
-            if not r:
-                QMessageBox.information(self, 'Выбор области', 'Сначала выберите область в списке.')
-                return
-            if tool == 'ink':
-                r.ink = rect
-            elif tool == 'box':
-                r.box = rect
-            else:
-                return
-            r.confirmed = False
-        self.mark_dirty()
-        self.refresh_regions()
-        self.region_chosen(next((i for i, r in enumerate(self.page.regions)
-                                 if r.id == (rid if tool == 'new' else self.selected_id)), -1))
-        self.tool.setCurrentIndex(0)
-        self.refresh_preview()
-
-    def confirm_region(self):
-        r = self._region()
-        if not r:
-            return
-        self.store_draft()
-        r.confirmed = True
-        self.mark_dirty()
-        self.refresh_regions()
-        self.refresh_preview()
-
+            r=self.selected()
+            if not r:return
+            self.checkpoint()
+            if mode=='ink':r.ink=rect;r.glyph_boxes=[]
+            elif mode=='rect':r.box=rect;r.polygon=boundary_rect(r)
+            else:return
+            self.refresh_list();self.preview()
+        self.choose_tool('boundary' if mode=='new' else 'select')
+    def move_vertex(self,event):
+        r=self.selected()
+        if not r:return
+        index,coords,finished=event
+        if not r.polygon:r.polygon=boundary_rect(r)
+        if index>=len(r.polygon):return
+        x,y=coords;r.polygon[index]=(max(0,min(x,self.original.width)),max(0,min(y,self.original.height)))
+        r.box=inner_text_box(r.polygon,r.box,self.original.size)
+        self.paint()
+        if finished:self.preview()
+    def insert_vertex(self,event):
+        r=self.selected()
+        if not r:return
+        self.checkpoint()
+        index,point=event
+        if not r.polygon:r.polygon=boundary_rect(r)
+        r.polygon.insert(index,point)
+        self.paint()
+    def reset_boundary(self):
+        r=self.selected()
+        if not r:return
+        self.checkpoint();r.polygon=[];r.box=r.ink;r.balloon=False
+        self.paint();self.preview();self.choose_tool('rect')
+        self.statusBar().showMessage('Контур удалён. Теперь выделите новый прямоугольник на изображении.',7000)
     def remove_region(self):
-        if not self._region():
-            return
-        self.page.regions = [r for r in self.page.regions if r.id != self.selected_id]
-        self.selected_id = None
-        self.mark_dirty()
-        self.refresh_regions()
-        self.region_chosen(-1)
-        self.refresh_preview()
-
-    def recognize(self):
-        if self.busy:
-            return
-        self.store_draft()
-        if self.page.regions and QMessageBox.question(self, 'Повторное распознавание',
-            'Заменить все области? Введённые переводы будут потеряны.') != QMessageBox.StandardButton.Yes:
-            return
-        self.busy = True
-        self.ocr_generation += 1
-        gen = self.ocr_generation
-        self.progress.setVisible(True)
-        self.statusBar().showMessage('Распознавание японского текста локальным Tesseract…')
-        mode = self.ocr_dir.currentData()
-        def ready(regions):
-            if gen != self.ocr_generation:
-                return
-            self.busy = False
-            self.progress.setVisible(False)
-            for rid, region in enumerate(regions, 1):
-                region.id = rid
-                region.confirmed = False
-            self.page.regions = regions
-            self.selected_id = None  # Old form must never overwrite fresh OCR results.
-            self.mark_dirty()
-            self.refresh_regions()
-            self.region_chosen(0 if regions else -1)
-            self.refresh_preview()
-            self.statusBar().showMessage(f'OCR: найдено {len(regions)} областей. Проверьте каждую.', 10000)
-        self.task(lambda _: detect_regions(self.original, mode), ready)
-
-    def processed(self, mode, regions=None, strength=None, font_percent=None):
-        regions = regions if regions is not None else self.page.regions
-        cleaned = clean_image(self.original, regions, strength if strength is not None else self.strength.value())
-        if mode == 'translated':
-            return add_translations(cleaned, regions, self.font_path,
-                font_percent if font_percent is not None else self.font_percent.value())
-        return cleaned
-
-    def refresh_preview(self):
-        if not hasattr(self, 'canvas'):
-            return
-        self.store_draft()
-        idx = self.mode.currentIndex()
-        if idx == 0:
-            self.preview_generation += 1
-            self.canvas.set_picture(self.original)
-            self.paint_overlays()
-            return
-        self.preview_generation += 1
-        gen = self.preview_generation
-        snap = deepcopy(self.page.regions)
-        strength = self.strength.value()
-        font_percent = self.font_percent.value()
-        mode = 'clean' if idx == 1 else 'translated'
-        self.statusBar().showMessage('Подготовка предпросмотра…')
+        r=self.selected()
+        if not r:return
+        self.checkpoint();self.page.regions.remove(r);self.selected_id=None
+        self.refresh_list();self.preview()
+    def recognize_selected(self):
+        self.store_form();r=self.selected()
+        if not r:return
+        self.ocr_number+=1;gen=self.ocr_number;rid=r.id;ink=r.ink
+        self.progress.show();direction=self.ocr_dir.currentData();image=self.original.copy()
+        def ready(result):
+            self.progress.hide()
+            current=next((r for r in self.page.regions if r.id==rid),None)
+            if gen!=self.ocr_number or not current:return
+            self.checkpoint();current.source=result.text
+            current.glyph_boxes=result.glyph_boxes;current.confidence=result.confidence
+            current.orientation=result.orientation
+            self.refresh_list();self.preview()
+        self.task(lambda _:recognize_selection(image,ink,direction),ready)
+    def process(self,translated=False,regions=None):
+        regions=deepcopy(regions or self.page.regions)
+        cleaned=clean_image(self.original,regions,self.strength.value())
+        return add_translations(cleaned,regions,self.font_path) if translated else cleaned
+    def preview(self):
+        if not hasattr(self,'mode'):return
+        self.preview_number+=1;version=self.preview_number
+        if self.mode.currentIndex()==0:self.canvas.set_picture(self.original);self.paint();return
+        regions=deepcopy(self.page.regions);strength=self.strength.value();which=self.mode.currentIndex()
+        original=self.original.copy();font=self.font_path
         def ready(image):
-            if gen != self.preview_generation:
-                return
-            self.canvas.set_picture(image)
-            self.paint_overlays()
-            self.statusBar().showMessage('Предпросмотр готов', 4000)
-        self.task(lambda _: self.processed(mode, snap, strength, font_percent), ready,
-                  error=lambda msg: self.statusBar().showMessage(msg, 9000))
-
+            if version!=self.preview_number:return
+            self.canvas.set_picture(image);self.paint()
+        self.task(lambda _:add_translations(clean_image(original,regions,strength),regions,font)
+                  if which==2 else clean_image(original,regions,strength),ready)
     def exchange(self):
-        self.store_draft()
-        if not any(r.action == 'translate' for r in self.page.regions):
-            QMessageBox.information(self, 'Перевод', 'Нет областей с действием «Перевести».')
-            return
+        self.store_form()
         def apply(values):
-            selected = self.selected_id
+            self.checkpoint()
             for r in self.page.regions:
-                if r.id in values:
-                    r.translated = values[r.id]
-            self.mark_dirty()
-            self.selected_id = None  # Avoid overwriting inserted translations from stale text edits.
-            self.refresh_regions()
-            self.region_chosen(next((i for i, r in enumerate(self.page.regions)
-                                     if r.id == selected), -1))
-            self.refresh_preview()
-        TranslationDialog(self.page, apply, self).exec()
-
-    def unconfirmed(self):
-        self.store_draft()
-        missing = [r.id for r in self.page.regions if not r.confirmed]
-        if missing:
-            QMessageBox.warning(self, 'Проверка областей',
-                'Сначала подтвердите все области: ' + ', '.join(f'[{n:04d}]' for n in missing))
-            return True
-        return False
-
-    def export(self, mode):
-        if self.busy or self.unconfirmed():
-            return
-        suffix = '_clean' if mode == 'clean' else '_translated'
-        default = str(self.path.with_name(self.path.stem + suffix + '.png'))
-        name, selected_filter = QFileDialog.getSaveFileName(self, 'Экспорт изображения', default,
-            'PNG без потерь (*.png);;JPEG высокого качества (*.jpg)')
-        if not name:
-            return
-        path = Path(name)
-        if not path.suffix:
-            path = path.with_suffix('.jpg' if 'JPEG' in selected_filter else '.png')
-        if path.resolve() == self.path:
-            QMessageBox.warning(self, 'Оригинал', 'Нельзя перезаписывать исходное изображение.')
-            return
-        try:
-            save_image(self.processed(mode), str(path))
-            self.statusBar().showMessage(f'Сохранено: {path}', 9000)
-        except Exception as exc:
-            self._error(str(exc))
-
+                if r.id in values:r.translated=values[r.id]
+            self.refresh_list();self.preview()
+        ExchangeDialog(self.page,apply,self).exec()
+    def export(self,mode):
+        self.store_form()
+        suggestion=self.path.with_name(self.path.stem+('_clean' if mode=='clean' else '_translated')+'.png')
+        name,fl=QFileDialog.getSaveFileName(self,'Экспорт',str(suggestion),'PNG без потерь (*.png);;JPEG (*.jpg)')
+        if not name:return
+        path=Path(name).with_suffix('.jpg' if 'JPEG' in fl and not Path(name).suffix else Path(name).suffix or '.png')
+        if path.resolve()==self.path:QMessageBox.warning(self,'Оригинал','Исходный файл нельзя перезаписывать.');return
+        try:save_image(self.process(mode=='translated'),str(path));self.statusBar().showMessage('Сохранено: '+str(path),7000)
+        except Exception as e:QMessageBox.warning(self,'Экспорт',str(e))
     def save_project(self):
-        self.store_draft()
-        default = str(self.project_path or self.path.with_suffix('.manga.json'))
-        name, _ = QFileDialog.getSaveFileName(self, 'Сохранить проект', default, 'Manga JSON (*.json)')
-        if not name:
-            return False
-        path = Path(name)
+        self.store_form();p=self.project_path or self.path.with_suffix('.manga.json')
+        name,_=QFileDialog.getSaveFileName(self,'Сохранить проект',str(p),'Проект манги (*.json)')
+        if not name:return False
         try:
-            path.write_text(json.dumps({'version': 1, 'pages': to_json_pages([self.page]),
-                'strength': self.strength.value(), 'font_percent': self.font_percent.value()},
-                ensure_ascii=False, indent=2), encoding='utf-8')
-            self.project_path = path
-            self.dirty = False
-            self._title()
-            self.statusBar().showMessage('Проект сохранён', 4500)
-            return True
-        except OSError as exc:
-            self._error(str(exc))
-            return False
-
+            Path(name).write_text(json.dumps({'version':2,'pages':to_json_pages([self.page]),
+                'strength':self.strength.value()},ensure_ascii=False,indent=2),encoding='utf8')
+            self.project_path=Path(name);self.dirty=False;self.setWindowTitle('Перевод — '+self.path.name);return True
+        except OSError as e:QMessageBox.warning(self,'Сохранение',str(e));return False
     def load_project(self):
-        if not self.may_discard():
-            return
-        name, _ = QFileDialog.getOpenFileName(self, 'Открыть проект', '', 'Manga JSON (*.json)')
-        if not name:
-            return
+        self.store_form()
+        if self.dirty and QMessageBox.question(self,'Несохранённый проект',
+            'Продолжить без сохранения текущих правок?', QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        file,_=QFileDialog.getOpenFileName(self,'Открыть проект',str(self.path.parent),'Проекты манги (*.json)')
+        if not file:return
         try:
-            data = json.loads(Path(name).read_text(encoding='utf-8'))
-            pages = from_json_pages(data['pages'])
-            if len(pages) != 1 or Path(pages[0].path).resolve() != self.path:
-                raise ValueError('Проект должен содержать эту же страницу.')
-            self.page = pages[0]
-            self.selected_id = None  # Old form must never overwrite the loaded project.
-            self.strength.setValue(data.get('strength', 60))
-            self.font_percent.setValue(data.get('font_percent', 100))
-            self.project_path = Path(name)
-            self.dirty = False
-            self._title()
-            self.refresh_regions()
-            self.region_chosen(0 if self.page.regions else -1)
-            self.refresh_preview()
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            self._error(str(exc))
-
-    def may_discard(self):
-        self.store_draft()
-        if not self.dirty:
-            return True
-        result = QMessageBox.question(self, 'Несохранённые изменения',
-            'В проекте есть несохранённые изменения. Закрыть без сохранения?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        return result == QMessageBox.StandardButton.Yes
-
-    def closeEvent(self, event):
-        if self.may_discard():
-            self.preview_generation += 1
-            self.ocr_generation += 1
-            event.accept()
-        else:
-            event.ignore()
+            data=json.loads(Path(file).read_text(encoding='utf8'))
+            pages=from_json_pages(data['pages'])
+            if len(pages)!=1 or Path(pages[0].path).resolve()!=self.path:
+                raise ValueError('Проект предназначен для другого изображения.')
+            self.page=pages[0];self.project_path=Path(file);self.selected_id=None
+            self.history.clear();self.redo_stack.clear();self.dirty=False
+            self.strength.setValue(data.get('strength',60))
+            self.refresh_list();self.preview()
+            self.setWindowTitle('Перевод — '+self.path.name)
+        except (OSError,ValueError,KeyError,TypeError) as e:
+            QMessageBox.warning(self,'Не удалось открыть проект',str(e))
+    def closeEvent(self,event):
+        self.store_form()
+        if not self.dirty:return super().closeEvent(event)
+        answer=QMessageBox.question(self,'Несохранённый проект','Закрыть без сохранения проекта?',
+              QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)
+        if answer==QMessageBox.StandardButton.Yes:event.accept()
+        else:event.ignore()

@@ -1,4 +1,4 @@
-"""Windows application entrypoint (no network services)."""
+"""Entrypoint for the offline Qt image viewer and manga translator."""
 import sys
 from PySide6.QtWidgets import QApplication
 from qt_common import STYLE
@@ -6,59 +6,51 @@ from qt_viewer import ViewerWindow
 
 
 def gui_self_test(app):
-    """Exercise the actual Qt viewer and editor in a Windows build runner."""
+    """Run a real Qt smoke test both before and after Windows installation."""
     from pathlib import Path
     from tempfile import TemporaryDirectory
     from PIL import Image, ImageDraw
     from qt_editor import EditorWindow
-
-    with TemporaryDirectory(prefix='manga-ui-smoke-') as directory:
-        path = Path(directory) / 'example.png'
-        canvas = Image.new('RGB', (400, 280), '#e6dfd2')
-        draw = ImageDraw.Draw(canvas)
-        draw.ellipse((90, 35, 310, 240), fill='#fffdf6', outline='#202933', width=3)
-        canvas.save(path)
-
-        viewer = ViewerWindow()
-        viewer.show()
-        editor = EditorWindow(path)
-        editor.show()
+    from manual_regions import suggest_boundary, inner_text_box
+    with TemporaryDirectory(prefix='manga-qt-smoke-') as directory:
+        path=Path(directory)/'example.png'
+        img=Image.new('RGB',(440,340),'#e6dfd1')
+        draw=ImageDraw.Draw(img)
+        draw.ellipse((75,30,360,300), fill='#fdfbf4',outline='#26292c',width=4)
+        img.save(path)
+        viewer=ViewerWindow();viewer.show()
+        editor=EditorWindow(path);editor.show()
         try:
             app.processEvents()
-            if not viewer.isVisible() or not editor.isVisible():
-                raise RuntimeError('Qt viewer/editor windows did not become visible')
-            if editor.canvas.scene().sceneRect().width() != 400:
-                raise RuntimeError('Qt editor failed to load a test page')
-            if not viewer.canvas.scene():
-                raise RuntimeError('Qt viewer scene was not initialized')
-            print('GUI smoke test: Qt viewer and editor created successfully')
+            assert viewer.isVisible() and editor.isVisible()
+            assert editor.canvas.scene().sceneRect().width()==440
+            assert viewer.canvas.scene() is not None
+            assert not viewer.library_panel.isVisible(), 'Viewer must start image-first'
+            assert editor.canvas.tool=='new', 'Editor must start in manual rectangle mode'
+            poly=suggest_boundary(img,(175,120,30,35))
+            if poly:
+                box=inner_text_box(poly,(175,120,30,35),img.size)
+                assert box[2]>0 and box[3]>0
+            print('GUI smoke test: viewer, editor and manual tools initialized')
         finally:
-            editor.close()
-            viewer.close()
-            app.processEvents()
+            editor.close();viewer.close();app.processEvents()
     return 0
 
 
 def main():
     if '--self-test' in sys.argv:
-        # Runs on the packaged executable without opening a GUI. Validates OCR assets.
         from engine import configure_ocr
-        command, languages = configure_ocr()
-        if not {'jpn', 'jpn_vert'} <= languages:
-            raise RuntimeError('Missing bundled jpn/jpn_vert OCR languages')
-        print(f'OCR ready: {command} | {sorted(languages)}')
+        command,languages=configure_ocr()
+        if not {'jpn','jpn_vert'}<=languages:
+            raise RuntimeError('Bundled Japanese OCR models are missing')
+        print('OCR ready:',command,sorted(languages))
         return 0
-    app = QApplication(sys.argv)
+    app=QApplication(sys.argv)
     app.setApplicationName('Manga Offline Translator')
     app.setOrganizationName('MangaOffline')
-    app.setStyle('Fusion')
-    app.setStyleSheet(STYLE)
-    if '--gui-self-test' in sys.argv:
-        return gui_self_test(app)
-    win = ViewerWindow()
-    win.show()
+    app.setStyle('Fusion');app.setStyleSheet(STYLE)
+    if '--gui-self-test' in sys.argv:return gui_self_test(app)
+    window=ViewerWindow();window.show()
     return app.exec()
 
-
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__=='__main__':sys.exit(main())

@@ -11,7 +11,7 @@ def gui_self_test(app):
     from tempfile import TemporaryDirectory
     from PIL import Image, ImageDraw
     from qt_editor import EditorWindow
-    from manual_regions import suggest_boundary, inner_text_box
+    from qt_editor import composite_text
     with TemporaryDirectory(prefix='manga-qt-smoke-') as directory:
         path=Path(directory)/'example.png'
         img=Image.new('RGB',(440,340),'#e6dfd1')
@@ -34,11 +34,22 @@ def gui_self_test(app):
                 raise RuntimeError('Viewer must expose a clearly labelled 100% button')
             assert not viewer.library_panel.isVisible(), 'Viewer must start image-first'
             assert editor.canvas.tool=='new', 'Editor must start in manual rectangle mode'
-            poly=suggest_boundary(img,(175,120,30,35))
-            if poly:
-                box=inner_text_box(poly,(175,120,30,35),img.size)
-                assert box[2]>0 and box[3]>0
-            print('GUI smoke test: viewer, editor and manual tools initialized')
+            # Full paint-style editor smoke: rectangle goes to image clipboard,
+            # text stays inside its box, other pixels remain unchanged.
+            editor._selected((130, 80, 125, 80))
+            if not app.clipboard().mimeData().hasImage():
+                raise RuntimeError('Selected fragment was not copied as an image')
+            editor.text_input.setPlainText('Hello\\nworld!')
+            editor.insert_text()
+            if len(editor.layers) != 1 or editor.canvas.text_edit_item is None:
+                raise RuntimeError('Bounded text editor failed to initialize')
+            rendered = composite_text(editor.working, editor.layers)
+            if rendered.getpixel((0, 0)) != editor.original.getpixel((0, 0)):
+                raise RuntimeError('Rendering text corrupted pixels outside its bounds')
+            if rendered.crop((130, 80, 255, 160)).tobytes() == editor.original.crop((130, 80, 255, 160)).tobytes():
+                raise RuntimeError('Translated text not drawn in selected area')
+            editor.dirty = False
+            print('GUI smoke test: viewer, manual clipboard selection, text edit and lossless compositing succeeded')
         finally:
             editor.close();viewer.close();app.processEvents()
     return 0

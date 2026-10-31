@@ -1,5 +1,5 @@
 #define MyAppName "Manga Offline Translator"
-#define MyAppVersion "0.4.0"
+#define MyAppVersion "0.4.1"
 #define MyAppPublisher "Manga Offline Translator Project"
 #define MyAppExeName "MangaOfflineTranslator.exe"
 [Setup]

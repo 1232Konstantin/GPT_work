@@ -47,7 +47,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = 'v0.4.1-preview.1'
+          $tag = 'v0.4.1-preview.2'
           $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_*_win64.exe | Select-Object -First 1
           if (-not $setup) { throw 'No setup file for preview release' }
           gh release view $tag *> $null

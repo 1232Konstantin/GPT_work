@@ -27,7 +27,7 @@ def _coarse_contours(image: Image.Image, rect: Rect):
     """
     W,H=image.size
     x,y,w,h=clip_xywh(rect,W,H)
-    radius=max(32,min(260,int(max(w,h)*1.15)))
+    radius=max(96,min(320,int(max(w,h)*1.7)))
     x0,y0=max(0,x-radius),max(0,y-radius)
     x1,y1=min(W,x+w+radius),min(H,y+h+radius)
     patch=np.array(image.convert('RGB').crop((x0,y0,x1,y1)))
@@ -37,9 +37,15 @@ def _coarse_contours(image: Image.Image, rect: Rect):
     # Local ink outlines, optionally joined over small holes.
     dark=cv2.inRange(gray,0,145)
     dark=cv2.morphologyEx(dark,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
-    contours,_=cv2.findContours(dark,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+    # Speech-bubble borders are often WHITE (with dark on both sides), so dark
+    # pixel contours alone miss colored manga. Include narrow closed Canny edges.
+    edges=cv2.Canny(gray,40,100)
+    outlines=[]
+    for binary in (dark,edges):
+        contours,_=cv2.findContours(binary,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+        outlines.extend(contours)
     result=[]
-    for contour in contours:
+    for contour in outlines:
         area=cv2.contourArea(contour)
         bx,by,bw,bh=cv2.boundingRect(contour)
         if area < max(120, w*h*1.65) or bw>=(x1-x0)*.97 or bh>=(y1-y0)*.97:
@@ -59,7 +65,9 @@ def _coarse_contours(image: Image.Image, rect: Rect):
         if area / max(bw*bh,1)<.32:
             continue
         margin=min(x-x0-bx, y-y0-by, bx+bw-x+x0-w, by+bh-y+y0-h)
-        score=(count*12 + min(20,margin)) / max(1.0,area**.16)
+        # Prefer close-fitting borders, rather than outer illustration edges.
+        margin_ratio=max(0,margin)/max(1,min(bw,bh))
+        score=(count*12 + min(20,margin) + min(10,margin_ratio*12)) / max(1.0,area**.16)
         result.append((score,contour,x0,y0))
     return sorted(result,key=lambda c:c[0],reverse=True)
 

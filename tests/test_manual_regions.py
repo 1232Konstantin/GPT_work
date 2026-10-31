@@ -11,9 +11,9 @@ def test_local_contour_rough_balloon():
     d=ImageDraw.Draw(im)
     d.ellipse((30,25,210,245),fill='white',outline='black',width=3)
     polygon=suggest_boundary(im,(100,110,30,45))
-    if polygon:
-        box=inner_text_box(polygon,(100,110,30,45),im.size)
-        assert box[2]>0 and box[3]>0
+    assert len(polygon)>=4
+    box=inner_text_box(polygon,(100,110,30,45),im.size)
+    assert box[2]>0 and box[3]>0
 
 def test_polygon_clipping_and_json_roundtrip():
     im=Image.new('RGB',(180,160),'white')

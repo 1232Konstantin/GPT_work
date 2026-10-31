@@ -87,3 +87,23 @@ def test_area_actions_preserve_original_and_translation_list():
     old = [{'path':'test.png','regions':[{'id':1,'ink':[0,0,1,1],
                                           'box':[0,0,2,2],'source':'x'}]}]
     assert from_json_pages(old)[0].regions[0].action == 'translate'
+
+def test_lanczos_display_resampling_uses_original_pixels():
+    from viewer_core import resample_for_display
+    # Alternating 1px columns are an extreme aliasing test.
+    src = np.zeros((256, 256, 3), dtype=np.uint8)
+    src[:, ::2] = 255
+    image = Image.fromarray(src, 'RGB')
+    resized = resample_for_display(image, (61, 47))
+    expected = image.resize((61, 47), Image.Resampling.LANCZOS)
+    assert resized.size == (61, 47)
+    assert resized.tobytes() == expected.tobytes()
+    assert resized.getpixel((15, 15))[0] not in (0, 255)
+    assert image.getpixel((0, 0)) == (255, 255, 255)
+    assert resample_for_display(image, image.size) is not image
+    try:
+        resample_for_display(image, (0, 50))
+    except ValueError:
+        pass
+    else:
+        assert False, 'Zero size must be rejected'

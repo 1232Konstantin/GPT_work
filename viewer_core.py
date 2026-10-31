@@ -120,3 +120,16 @@ def find_duplicates(paths: Iterable[Path], *,
         groups.append(DuplicateGroup(tuple(sorted(group_paths, key=lambda p: natural_key(str(p)))), kind, w, h))
     groups.sort(key=lambda group: natural_key(str(group.paths[0])))
     return DuplicateScan(groups, errors, checked)
+
+def resample_for_display(image: Image.Image, target: tuple[int, int]) -> Image.Image:
+    """High-quality thumbnail from ORIGINAL pixels; never rescale a preview.
+
+    Pure function; safe to run on a worker thread. The original stays unchanged.
+    This is for on-screen presentation only, not exporting edited images.
+    """
+    width, height = target
+    if width < 1 or height < 1:
+        raise ValueError('Display dimensions must be positive')
+    if image.size == target:
+        return image.copy()
+    return image.resize(target, Image.Resampling.LANCZOS)

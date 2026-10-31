@@ -25,6 +25,13 @@ def gui_self_test(app):
             assert viewer.isVisible() and editor.isVisible()
             assert editor.canvas.scene().sceneRect().width()==440
             assert viewer.canvas.scene() is not None
+            viewer.canvas.set_picture(img)
+            if viewer.canvas.pixmap_item.transformationMode() != __import__('PySide6.QtCore', fromlist=['Qt']).Qt.TransformationMode.SmoothTransformation:
+                raise RuntimeError('Viewer image item is using low-quality scaling')
+            if viewer.title_label.isVisible():
+                raise RuntimeError('Viewer must not consume space for a permanent filename header')
+            if viewer.actual_action.text() != '100%':
+                raise RuntimeError('Viewer must expose a clearly labelled 100% button')
             assert not viewer.library_panel.isVisible(), 'Viewer must start image-first'
             assert editor.canvas.tool=='new', 'Editor must start in manual rectangle mode'
             poly=suggest_boundary(img,(175,120,30,35))

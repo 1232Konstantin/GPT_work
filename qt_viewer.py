@@ -12,18 +12,32 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QListWidget,
     QListWidgetItem, QLabel, QToolBar, QCheckBox, QComboBox, QPushButton,
     QFileDialog, QMessageBox, QDialog, QTreeWidget, QTreeWidgetItem, QHeaderView,
-    QProgressBar, QScrollArea, QFrame)
+    QProgressBar, QScrollArea, QFrame, QToolButton, QMenu)
 
 from engine import open_image
-from viewer_core import discover_images, find_duplicates, sort_images
+from viewer_core import discover_images, find_duplicates, sort_images, resample_for_display
 from qt_common import Task, pixmap_from_pil
 
 
 class PictureView(QGraphicsView):
+    """Pixel-preserving zoom with asynchronous high-quality downsampling.
+
+    Cached images are resized only from the original, never from a preview.
+    Qt's smooth transform stays enabled while a Lanczos render is prepared.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
         self.pixmap_item: QGraphicsPixmapItem | None = None
+        self._source_image: Image.Image | None = None
+        self._full_pixmap = None
+        self._rendered_size = None
+        self._quality_cache: OrderedDict[tuple[int, int], Image.Image] = OrderedDict()
+        self._quality_jobs: set[Task] = set()
+        self._quality_version = 0
+        self._quality_timer = QTimer(self)
+        self._quality_timer.setSingleShot(True)
+        self._quality_timer.timeout.connect(self._render_quality)
         self.setBackgroundBrush(QBrush(QColor('#0e131b')))
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -33,39 +47,128 @@ class PictureView(QGraphicsView):
         self.angle = 0
 
     def set_picture(self, image: Image.Image):
+        self._quality_version += 1
+        self._quality_timer.stop()
+        self._source_image = image
+        self._quality_cache.clear()
+        self._full_pixmap = pixmap_from_pil(image)
+        self._rendered_size = image.size
         self.scene().clear()
-        self.pixmap_item = self.scene().addPixmap(pixmap_from_pil(image))
+        self.pixmap_item = self.scene().addPixmap(self._full_pixmap)
+        # QGraphicsPixmapItem's default is FastTransformation even if the
+        # view has SmoothPixmapTransform set. Explicitly override the ITEM.
+        self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.pixmap_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
         self.angle = 0
         self.is_fit = True
+        self.scene().setSceneRect(self.pixmap_item.sceneBoundingRect())
         self.fit_picture()
+
+    def _queue_quality(self):
+        if self._source_image is None or self.pixmap_item is None:
+            return
+        self._quality_version += 1
+        self._quality_timer.start(140)
+
+    def _quality_dimensions(self):
+        image = self._source_image
+        if image is None:
+            return None
+        scale = max(abs(self.transform().m11()), abs(self.transform().m22()))
+        factor = min(1.0, scale * self.viewport().devicePixelRatioF())
+        if factor >= 0.98:
+            return image.size
+        return (max(1, round(image.width * factor)),
+                max(1, round(image.height * factor)))
+
+    def _apply_quality(self, prepared: Image.Image):
+        if self._source_image is None or self.pixmap_item is None:
+            return
+        if prepared.size == self._rendered_size:
+            return
+        if prepared.size == self._source_image.size:
+            display = self._full_pixmap
+        else:
+            display = pixmap_from_pil(prepared)
+            # Keep the logical scene geometry equal to the ORIGINAL image,
+            # independent of the reduced texture resolution. Rotation and
+            # panning therefore retain their coordinates and zoom anchors.
+            display.setDevicePixelRatio(prepared.width / self._source_image.width)
+        self.pixmap_item.setPixmap(display)
+        self._rendered_size = prepared.size
+        if self.angle:
+            self.pixmap_item.setTransformOriginPoint(self.pixmap_item.boundingRect().center())
+        self.scene().setSceneRect(self.scene().itemsBoundingRect())
+
+    def _render_quality(self):
+        image = self._source_image
+        target = self._quality_dimensions()
+        if image is None or target is None or self.pixmap_item is None:
+            return
+        if target == self._rendered_size:
+            return
+        if target == image.size:
+            self._apply_quality(image)
+            return
+        cached = self._quality_cache.get(target)
+        if cached is not None:
+            self._quality_cache.move_to_end(target)
+            self._apply_quality(cached)
+            return
+        version = self._quality_version
+        job = Task(lambda _: resample_for_display(image, target))
+        self._quality_jobs.add(job)
+        def done(result):
+            self._quality_jobs.discard(job)
+            if image is not self._source_image or version != self._quality_version:
+                return
+            self._quality_cache[target] = result
+            while len(self._quality_cache) > 3:
+                self._quality_cache.popitem(last=False)
+            self._apply_quality(result)
+        def failed(_message):
+            self._quality_jobs.discard(job)
+            # Keep smooth Qt interpolation as a fallback on resampling failure.
+        job.signals.result.connect(done)
+        job.signals.error.connect(failed)
+        QThreadPool.globalInstance().start(job)
 
     def fit_picture(self):
         if self.pixmap_item:
             self.resetTransform()
-            self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.fitInView(self.scene().itemsBoundingRect(),
+                           Qt.AspectRatioMode.KeepAspectRatio)
             self.is_fit = True
+            self._queue_quality()
 
     def actual_size(self):
         if self.pixmap_item:
             self.resetTransform()
             self.is_fit = False
             self.centerOn(self.pixmap_item)
+            self._queue_quality()
 
     def zoom(self, amount):
         if self.pixmap_item:
+            current = abs(self.transform().m11())
+            proposed = current * amount
+            if not 0.04 <= proposed <= 16:
+                return
             self.scale(amount, amount)
             self.is_fit = False
+            self._queue_quality()
 
     def rotate(self, degrees):
         if self.pixmap_item:
             self.angle = (self.angle + degrees) % 360
-            # Rotate around image center, not its upper-left corner.
             rect = self.pixmap_item.boundingRect()
             self.pixmap_item.setTransformOriginPoint(rect.center())
             self.pixmap_item.setRotation(self.angle)
             self.scene().setSceneRect(self.scene().itemsBoundingRect())
             if self.is_fit:
                 self.fit_picture()
+            else:
+                self._queue_quality()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -73,8 +176,12 @@ class PictureView(QGraphicsView):
             self.fit_picture()
 
     def wheelEvent(self, event):
-        self.zoom(1.18 if event.angleDelta().y() > 0 else 1 / 1.18)
-
+        delta = event.angleDelta().y()
+        if delta == 0:
+            delta = event.pixelDelta().y()
+        if delta:
+            self.zoom(1.18 ** (delta / 120.0))
+        event.accept()
 
 class DuplicateDialog(QDialog):
     def __init__(self, scan, jump_to, parent=None):
@@ -157,28 +264,29 @@ class ViewerWindow(QMainWindow):
         action.triggered.connect(func)
         if shortcut:
             action.setShortcut(shortcut)
-        toolbar.addAction(action)
+        if toolbar is not None:
+            toolbar.addAction(action)
+        self.addAction(action)
         return action
 
     def _build_ui(self):
-        toolbar = QToolBar('Инструменты')
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, toolbar)
-        self._action(toolbar, '▣  Папка', self.choose_folder, 'Ctrl+O')
-        self._action(toolbar, '＋  Файл', self.choose_file)
-        self._action(toolbar, '☷  Файлы', self.toggle_library, 'Ctrl+L')
-        self._action(toolbar, 'Дубликаты', self.find_duplicates, 'Ctrl+D')
-        toolbar.addSeparator()
-        self._action(toolbar, '←', lambda: self.move(-1), 'Left')
-        self._action(toolbar, '→', lambda: self.move(1), 'Right')
-        self._action(toolbar, 'Вписать', self.picture_fit, 'F')
-        self._action(toolbar, '1:1', self.canvas_actual, '1')
-        self._action(toolbar, '↶ 90°', lambda: self.canvas.rotate(-90), 'Shift+R')
-        self._action(toolbar, '↷ 90°', lambda: self.canvas.rotate(90), 'R')
-        self._action(toolbar, '⛶  Экран', self.toggle_fullscreen, 'F11')
-        toolbar.addSeparator()
-        self.edit_action = self._action(toolbar, '✎  Перевести страницу', self.open_editor, 'Ctrl+E')
+        # One compact command strip at the bottom. Image-first as in Windows 7.
+        # File management and translation are accessible through a small menu.
+        toolbar = None
+        self.folder_action = self._action(toolbar, 'Открыть папку…', self.choose_folder, 'Ctrl+O')
+        self.file_action = self._action(toolbar, 'Открыть изображение…', self.choose_file, 'Ctrl+Shift+O')
+        self.library_action = self._action(toolbar, 'Список файлов', self.toggle_library, 'Ctrl+L')
+        self.duplicate_action = self._action(toolbar, 'Найти дубликаты', self.find_duplicates, 'Ctrl+D')
+        self.previous_action = self._action(toolbar, '‹', lambda: self.move(-1), 'Left')
+        self.next_action = self._action(toolbar, '›', lambda: self.move(1), 'Right')
+        self.zoom_out_action = self._action(toolbar, '−', lambda: self.canvas.zoom(1/1.25), '-')
+        self.zoom_in_action = self._action(toolbar, '+', lambda: self.canvas.zoom(1.25), '+')
+        self.fit_action = self._action(toolbar, 'Вписать', self.picture_fit, 'F')
+        self.actual_action = self._action(toolbar, '100%', self.canvas_actual, '1')
+        self.rotate_left_action = self._action(toolbar, '↶', lambda: self.canvas.rotate(-90), 'Shift+R')
+        self.rotate_right_action = self._action(toolbar, '↷', lambda: self.canvas.rotate(90), 'R')
+        self.fullscreen_action = self._action(toolbar, '⛶', self.toggle_fullscreen, 'F11')
+        self.edit_action = self._action(toolbar, 'Перевести страницу', self.open_editor, 'Ctrl+E')
         self.edit_action.setEnabled(False)
 
         main = QWidget()
@@ -238,39 +346,76 @@ class ViewerWindow(QMainWindow):
         rv = QVBoxLayout(viewer_panel)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
-        top = QHBoxLayout()
-        self.title_label = QLabel('Выберите изображение')
-        self.title_label.setStyleSheet('font-size: 13px; font-weight: 500; color: #d4dce7; padding: 6px 10px;')
-        self.title_label.setMinimumWidth(150)
-        top.addWidget(self.title_label, 1)
-        self.image_info = QLabel('')
-        self.image_info.setProperty('muted', True)
-        top.addWidget(self.image_info)
-        rv.addLayout(top)
+        # Metadata is available in the window title and image tooltip,
+        # not in a permanent header stealing vertical screen space.
+        self.title_label = QLabel()
+        self.image_info = QLabel()
         self.canvas = PictureView()
         self.canvas.setFrameShape(QFrame.Shape.NoFrame)
         rv.addWidget(self.canvas, 1)
+        # Small centered Win7-inspired transport panel, not a wide toolbar.
         bottom = QHBoxLayout()
-        self.counter_label = QLabel('0 / 0')
-        self.counter_label.setStyleSheet('font-weight:600;')
-        bottom.addWidget(self.counter_label)
+        bottom.setContentsMargins(0, 2, 0, 3)
+        bottom.setSpacing(0)
         bottom.addStretch(1)
-        self.filmstrip = []
-        for n in range(-3, 4):
-            button = QPushButton('')
-            button.setFixedSize(92, 74)
-            button.clicked.connect(lambda _=False, offset=n: self.move(offset))
-            self.filmstrip.append(button)
-            bottom.addWidget(button)
+        controls = QFrame(viewer_panel)
+        controls.setObjectName('compactControls')
+        controls.setStyleSheet("""
+          QFrame#compactControls { background: #25303c; border: 1px solid #3d4c5c; border-radius: 7px; }
+          QFrame#compactControls QToolButton {
+            color: #e6edf5; background: transparent; border: none;
+            border-radius: 4px; padding: 1px 5px; font-weight: 600;
+          }
+          QFrame#compactControls QToolButton:hover { background: #40546a; }
+          QFrame#compactControls QToolButton:pressed { background: #52718d; }
+          QFrame#compactControls QToolButton:disabled { color: #657487; }
+        """)
+        bar = QHBoxLayout(controls)
+        bar.setContentsMargins(5, 2, 5, 2)
+        bar.setSpacing(1)
+        menu = QMenu(self)
+        for action in (self.folder_action, self.file_action, self.library_action,
+                       self.duplicate_action, self.edit_action):
+            menu.addAction(action)
+        menu_button = QToolButton(controls)
+        menu_button.setText('☰')
+        menu_button.setToolTip('Файлы, дубликаты и перевод')
+        menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu_button.setMenu(menu)
+        menu_button.setFixedSize(34, 29)
+        bar.addWidget(menu_button)
+        def add_control(action, width=35, tip=None):
+            button = QToolButton(controls)
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            button.setFixedSize(width, 29)
+            if tip:
+                button.setToolTip(tip)
+            bar.addWidget(button)
+            return button
+        add_control(self.previous_action, 31, 'Предыдущее изображение · ←')
+        add_control(self.next_action, 31, 'Следующее изображение · →')
+        add_control(self.zoom_out_action, 30, 'Уменьшить')
+        add_control(self.zoom_in_action, 30, 'Увеличить')
+        add_control(self.fit_action, 67, 'Вписать целиком · F')
+        add_control(self.actual_action, 53, 'Исходный размер · 100%')
+        add_control(self.rotate_left_action, 32, 'Повернуть влево · Shift+R')
+        add_control(self.rotate_right_action, 32, 'Повернуть вправо · R')
+        add_control(self.fullscreen_action, 33, 'Полный экран · F11')
+        self.counter_label = QLabel('0 / 0', controls)
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.counter_label.setMinimumWidth(63)
+        self.counter_label.setStyleSheet('color: #b5c3d2; border: none; padding: 0 3px; font-size: 11px;')
+        bar.addWidget(self.counter_label)
+        bottom.addWidget(controls)
         bottom.addStretch(1)
-        # Win7-style viewer: no permanent filmstrip; picture occupies the canvas.
-        for button in self.filmstrip: button.hide()
-        self.counter_label.setText('')
         rv.addLayout(bottom)
+        self.filmstrip = []
         split.addWidget(left)
         split.addWidget(viewer_panel)
         split.setSizes([330, 1050])
         self.library_panel.hide()   # Library appears only on user request.
+        self.statusBar().hide()      # Do not reserve another full-width strip.
         self._update_buttons()
 
     def toggle_library(self):
@@ -376,6 +521,7 @@ class ViewerWindow(QMainWindow):
         self.image_generation += 1
         generation = self.image_generation
         self.title_label.setText(path.name)
+        self.setWindowTitle(path.name + ' — Manga Offline Translator')
         self.image_info.setText('Загрузка…')
         self.list.blockSignals(True)
         self.list.setCurrentRow(self.visible.index(path))
@@ -390,6 +536,7 @@ class ViewerWindow(QMainWindow):
                 return
             self.canvas.set_picture(image)
             self.image_info.setText(f'{image.width} × {image.height} px · {path.suffix.upper()[1:]}')
+            self.canvas.setToolTip(f'{path.name} · {image.width} × {image.height} px')
         self.run_task(lambda _: open_image(str(path)), finished,
                       failed=lambda msg: self.statusBar().showMessage(f'{path.name}: {msg}', 9000))
 

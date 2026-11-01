@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
     QMenu, QStackedWidget, QSlider, QButtonGroup)
 
 from engine import open_image
-from paint_core import clip_box, clear_letters, brush_segment, palette_smudge
+from paint_core import clip_box, brush_segment, palette_smudge
+from cleanup_core import detect_glyph_boxes, remove_glyphs
 from qt_common import pixmap_from_pil, Task
 
 
@@ -105,6 +106,8 @@ class ImageCanvas(QGraphicsView):
     paste_moved = Signal()
     text_rectangle_requested = Signal(object)
     context_menu_requested = Signal(object)
+    cleanup_box_toggled = Signal(int)
+    cleanup_box_drawn = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,6 +121,9 @@ class ImageCanvas(QGraphicsView):
         self.setMouseTracking(True)
         self.pixmap_item = None
         self.selected_item = None
+        self.cleanup_items = []
+        self.cleanup_boxes = []
+        self.cleanup_enabled = []
         self.text_items = []
         self.text_edit_item = None
         self.text_frame = None
@@ -251,6 +257,22 @@ class ImageCanvas(QGraphicsView):
             self.selected_item.setZValue(45)
             self.selected_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
+    def set_cleanup_boxes(self, boxes: list[tuple[int,int,int,int]], enabled: list[bool]):
+        for obj in self.cleanup_items:
+            if obj.scene() == self.scene():
+                self.scene().removeItem(obj)
+        self.cleanup_items.clear()
+        self.cleanup_boxes = list(boxes)
+        self.cleanup_enabled = list(enabled)
+        for (x,y,w,h), active in zip(self.cleanup_boxes, self.cleanup_enabled):
+            outline=self.scene().addRect(QRectF(x,y,w,h),
+                QPen(QColor('#39f0a9') if active else QColor('#999999'),
+                     2.3 if active else 1.3,
+                     Qt.PenStyle.SolidLine if active else Qt.PenStyle.DashLine))
+            outline.setZValue(55)
+            outline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.cleanup_items.append(outline)
+
     def set_text_layers(self, layers: list[TextLayer], selected: int):
         for frame in self.text_items:
             self.scene().removeItem(frame)
@@ -331,7 +353,16 @@ class ImageCanvas(QGraphicsView):
         if self.tool == 'pan' or self.tool == 'paste':
             super().mousePressEvent(event); return
         point = self._point(event)
-        if self.tool in ('new','text','text_new'):
+        if self.tool == 'new' and self.cleanup_boxes:
+            candidates=[]
+            for idx,(x,y,w,h) in enumerate(self.cleanup_boxes):
+                if x<=point.x()<=x+w and y<=point.y()<=y+h:
+                    candidates.append((w*h,idx))
+            if candidates:
+                self.cleanup_box_toggled.emit(min(candidates)[1])
+                event.accept()
+                return
+        if self.tool in ('new','text','text_new','cleanup_add'):
             if self.tool == 'text':
                 for i in reversed(range(len(self._text_layers))):
                     if i == self._selected_text:
@@ -419,6 +450,8 @@ class ImageCanvas(QGraphicsView):
                     box=(round(rect.x()),round(rect.y()),round(rect.width()),round(rect.height()))
                     if self.tool == 'text_new':
                         self.text_rectangle_requested.emit(box)
+                    elif self.tool == 'cleanup_add':
+                        self.cleanup_box_drawn.emit(box)
                     else:
                         self.rectangle_selected.emit(box)
                 event.accept(); return
@@ -453,6 +486,11 @@ class EditorWindow(QMainWindow):
         self.dirty = False
         self._in_sync = False
         self._stroke_in_progress = False
+        self._cleanup_candidates=[]
+        self._cleanup_enabled=[]
+        self._cleanup_done_boxes=[]
+        self._cleanup_done_selections=set()
+        self._cleanup_preview_active=False
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._refresh_pixmap)
@@ -483,8 +521,24 @@ class EditorWindow(QMainWindow):
         sel.addWidget(QLabel('1. Выделите фрагмент изображения'))
         sel.addWidget(QLabel('2. Вставьте его в переводчик'))
         sel.addWidget(QLabel('3. Очистите буквы или исправьте кистью'))
-        self.clear_button=QPushButton('Очистить найденные штрихи')
+        help_label=QLabel('Зелёные рамки — будут очищены, серые — исключены. Щелчком меняйте отметку.')
+        help_label.setWordWrap(True)
+        sel.addWidget(help_label)
+        self.cleanup_stats=QLabel('Выделите надпись.')
+        sel.addWidget(self.cleanup_stats)
+        self.detect_button=QPushButton('Найти буквы')
+        self.detect_button.clicked.connect(self.detect_cleanup)
+        sel.addWidget(self.detect_button)
+        self.manual_box_button=QPushButton('Добавить рамку вручную')
+        self.manual_box_button.clicked.connect(lambda:self.set_tool('cleanup_add'))
+        sel.addWidget(self.manual_box_button)
+        self.preview_button=QPushButton('Предпросмотр результата')
+        self.preview_button.clicked.connect(self.preview_cleanup)
+        self.preview_button.setEnabled(False)
+        sel.addWidget(self.preview_button)
+        self.clear_button=QPushButton('Очистить отмеченные рамки')
         self.clear_button.clicked.connect(self.clear_selection)
+        self.clear_button.setEnabled(False)
         sel.addWidget(self.clear_button)
         self.selection_text_button=QPushButton('Создать отдельную рамку текста')
         self.selection_text_button.clicked.connect(self.insert_text)
@@ -605,16 +659,15 @@ class EditorWindow(QMainWindow):
         bar.addSeparator()
         self.actions={}
         for tool,label,shortcut in (
-            ('new','▭ Выделить','Alt+S'),('clear','Очистить буквы','Alt+C'),
+            ('new','▭ Выделить','Alt+S'),
             ('text','Текст','Alt+T'),('brush','Кисть','Alt+B'),('restore','Восстановить','Alt+E'),
             ('smudge','Мастихин','Alt+M'),('picker','Пипетка','Alt+I'),('pan','Рука',None),
             ('paste','Вставить фрагмент',None)):
             action=QAction(label,self);self.actions[tool]=action
             if shortcut:action.setShortcut(QKeySequence(shortcut))
-            if tool not in ('clear','paste'):
+            if tool!='paste':
                 action.setCheckable(True)
-            if tool=='clear':action.triggered.connect(self.clear_selection)
-            elif tool=='paste':action.triggered.connect(lambda:self.paste_fragment(force_image=True))
+            if tool=='paste':action.triggered.connect(lambda:self.paste_fragment(force_image=True))
             elif tool=='text':action.triggered.connect(self.insert_text)
             else:action.triggered.connect(lambda _,name=tool:self.set_tool(name))
             bar.addAction(action)
@@ -644,6 +697,8 @@ class EditorWindow(QMainWindow):
         self.canvas.text_layer_selected.connect(self._choose_text_layer)
         self.canvas.text_rectangle_requested.connect(self._create_text_box)
         self.canvas.context_menu_requested.connect(self._context_menu)
+        self.canvas.cleanup_box_toggled.connect(self._toggle_cleanup_box)
+        self.canvas.cleanup_box_drawn.connect(self._manual_cleanup_box)
         self.set_tool('new')
 
     def _mark(self):
@@ -651,7 +706,8 @@ class EditorWindow(QMainWindow):
         self.setWindowTitle('* Редактор — '+self.path.name)
 
     def _checkpoint(self):
-        self.history.append((self.working.copy(),deepcopy(self.layers),self.selection))
+        self.history.append((self.working.copy(),deepcopy(self.layers),self.selection,
+                             list(self._cleanup_done_boxes),set(self._cleanup_done_selections)))
         if len(self.history)>12:self.history.pop(0)
         self.future.clear();self._mark()
 
@@ -661,10 +717,14 @@ class EditorWindow(QMainWindow):
         if self.canvas.text_edit_item is not None and self.canvas.text_edit_item.hasFocus():
             self.canvas.text_edit_item.document().undo();return
         if not self.history:return
-        self.future.append((self.working.copy(),deepcopy(self.layers),self.selection))
-        self.working,self.layers,self.selection=self.history.pop()
+        self.future.append((self.working.copy(),deepcopy(self.layers),self.selection,
+                            list(self._cleanup_done_boxes),set(self._cleanup_done_selections)))
+        (self.working,self.layers,self.selection,
+         self._cleanup_done_boxes,self._cleanup_done_selections)=self.history.pop()
+        self._cleanup_candidates=[];self._cleanup_enabled=[]
+        self._cleanup_preview_active=False
         self.selected_text=-1
-        self.canvas.cancel_paste();self._sync()
+        self.canvas.cancel_paste();self._sync();self._refresh_cleanup_overlay()
 
     def redo(self):
         if self.text_input.hasFocus():
@@ -672,10 +732,13 @@ class EditorWindow(QMainWindow):
         if self.canvas.text_edit_item is not None and self.canvas.text_edit_item.hasFocus():
             self.canvas.text_edit_item.document().redo();return
         if not self.future:return
-        self.history.append((self.working.copy(),deepcopy(self.layers),self.selection))
-        self.working,self.layers,self.selection=self.future.pop()
+        self.history.append((self.working.copy(),deepcopy(self.layers),self.selection,
+                             list(self._cleanup_done_boxes),set(self._cleanup_done_selections)))
+        (self.working,self.layers,self.selection,
+         self._cleanup_done_boxes,self._cleanup_done_selections)=self.future.pop()
+        self._cleanup_candidates=[];self._cleanup_enabled=[]
         self.selected_text=-1
-        self.canvas.cancel_paste();self._sync()
+        self.canvas.cancel_paste();self._sync();self._refresh_cleanup_overlay()
 
     def _refresh_pixmap(self):
         self.canvas.set_picture(self.working)
@@ -690,11 +753,13 @@ class EditorWindow(QMainWindow):
         self._in_sync=False
 
     def _selected(self,box):
+        self._stop_cleanup_preview()
         self.commit_paste()
         self.selection=clip_box(box,self.working.size)
         self.canvas.set_selection(self.selection)
         self.copy_fragment()
-        self.statusBar().showMessage('Фрагмент скопирован в буфер как картинка. Очистите буквы или вставьте перевод.',7500)
+        self.detect_cleanup()
+        self.statusBar().showMessage('Фрагмент скопирован. Проверьте зелёные рамки букв перед очисткой.',8500)
 
     def _set_brush_color(self,color):
         self.brush_color=QColor(color)
@@ -712,8 +777,9 @@ class EditorWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction('Выделить прямоугольник',lambda:self.set_tool('new'))
         menu.addAction('Новая рамка текста',self.insert_text)
-        clear=menu.addAction('Очистить буквы',self.clear_selection)
-        clear.setEnabled(self.selection is not None)
+        menu.addAction('Найти буквы',self.detect_cleanup)
+        clear=menu.addAction('Очистить отмеченные рамки',self.clear_selection)
+        clear.setEnabled(self.clear_button.isEnabled())
         menu.addSeparator()
         menu.addAction('Кисть',lambda:self.set_tool('brush'))
         menu.addAction('Мастихин',lambda:self.set_tool('smudge'))
@@ -791,19 +857,121 @@ class EditorWindow(QMainWindow):
             self.selection=None;self.canvas.set_selection(None)
         self.set_tool('new')
 
-    def clear_selection(self):
+    def _refresh_cleanup_overlay(self):
+        if not self._cleanup_preview_active:
+            self.canvas.set_cleanup_boxes(self._cleanup_candidates,self._cleanup_enabled)
+        enabled=sum(self._cleanup_enabled)
+        self.cleanup_stats.setText(
+            f'Найдено рамок: {len(self._cleanup_candidates)}. Отмечено: {enabled}.')
+        self.clear_button.setEnabled(enabled>0)
+        self.preview_button.setEnabled(enabled>0)
+        self.preview_button.setText('Вернуться к оригиналу' if self._cleanup_preview_active
+                                    else 'Предпросмотр результата')
+
+    def preview_cleanup(self):
+        if self._cleanup_preview_active:
+            self._cleanup_preview_active=False
+            self.canvas.set_picture(self.working)
+            self._refresh_cleanup_overlay()
+            return
+        if not any(self._cleanup_enabled):
+            return
+        allowed=[box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
+                 if active and not any(self._boxes_overlap(box,done)
+                                       for done in self._cleanup_done_boxes)]
+        if not allowed:
+            return
+        preview,_=remove_glyphs(self.working,allowed)
+        self._cleanup_preview_active=True
+        self.canvas.set_cleanup_boxes([],[])
+        self.canvas.set_picture(preview)
+        self._refresh_cleanup_overlay()
+
+    def _stop_cleanup_preview(self):
+        if self._cleanup_preview_active:
+            self._cleanup_preview_active=False
+            self.canvas.set_picture(self.working)
+
+    def detect_cleanup(self):
+        self._stop_cleanup_preview()
         if self.selection is None:
-            self.statusBar().showMessage('Сначала выделите надпись прямоугольником.',6000);return
+            self.cleanup_stats.setText('Сначала выделите надпись.')
+            return
+        if self.selection in self._cleanup_done_selections:
+            self._cleanup_candidates=[]
+            self._cleanup_enabled=[]
+            self._refresh_cleanup_overlay()
+            self.cleanup_stats.setText('Область уже очищена. Ctrl+Z — отменить.')
+            return
+        # Only show candidate rectangles; do not modify the image here.
+        boxes=detect_glyph_boxes(self.working,self.selection)
+        self._cleanup_candidates=boxes
+        self._cleanup_enabled=[
+            not any(self._boxes_overlap(box,done) for done in self._cleanup_done_boxes)
+            for box in boxes]
+        self._refresh_cleanup_overlay()
+        if not boxes:
+            self.statusBar().showMessage('Буквы не найдены. Добавьте рамки вручную.',6500)
+
+    @staticmethod
+    def _boxes_overlap(a,b):
+        x,y,w,h=a
+        xx,yy,ww,hh=b
+        return x<xx+ww and x+w>xx and y<yy+hh and y+h>yy
+
+    def _toggle_cleanup_box(self,index):
+        self._stop_cleanup_preview()
+        if not 0<=index<len(self._cleanup_enabled):return
+        self._cleanup_enabled[index]=not self._cleanup_enabled[index]
+        self._refresh_cleanup_overlay()
+
+    def _manual_cleanup_box(self,box):
+        self._stop_cleanup_preview()
+        if self.selection is None:
+            self.statusBar().showMessage('Сначала выделите надпись.',6000)
+            self.set_tool('new')
+            return
+        x,y,w,h=box
+        sx,sy,sw,sh=self.selection
+        left=max(x,sx)
+        top=max(y,sy)
+        right=min(x+w,sx+sw)
+        bottom=min(y+h,sy+sh)
+        if right-left>=3 and bottom-top>=3:
+            self._cleanup_candidates.append((left,top,right-left,bottom-top))
+            self._cleanup_enabled.append(True)
+            self._refresh_cleanup_overlay()
+        self.set_tool('new')
+
+    def clear_selection(self):
+        self._stop_cleanup_preview()
+        if self.selection is None:
+            self.statusBar().showMessage('Сначала выделите прямоугольную область.',6000)
+            return
+        if self.selection in self._cleanup_done_selections:
+            self.statusBar().showMessage('Уже очищено. Повторное нажатие ничего не изменяет.',6500)
+            return
         self.commit_paste()
-        box=self.selection
-        old=self.working.copy()
-        new,count,_=clear_letters(old,box)
+        approved=[box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
+                  if active and not any(self._boxes_overlap(box,done)
+                                        for done in self._cleanup_done_boxes)]
+        if not approved:
+            self.statusBar().showMessage('Нет подтверждённых рамок для очистки.',6500)
+            return
+        result,count=remove_glyphs(self.working,approved)
         if not count:
-            self.statusBar().showMessage('Штрихи не найдены; используйте кисть восстановления/цвета.',8000);return
+            self.statusBar().showMessage('Изменений нет.',6500)
+            return
         self._checkpoint()
-        self.working=new
+        self.working=result
+        self._cleanup_done_boxes.extend(approved)
+        self._cleanup_done_selections.add(self.selection)
+        self._cleanup_candidates=[]
+        self._cleanup_enabled=[]
         self._sync()
-        self.statusBar().showMessage(f'Очистка: обработано {count} пикселей штрихов. Остальное не затронуто. Ctrl+Z — отменить.',9000)
+        self._refresh_cleanup_overlay()
+        self.statusBar().showMessage(
+            f'Обработано {len(approved)} рамок. Вне рамок ни один пиксель не изменён. Ctrl+Z — отменить.',9000)
 
     def set_tool(self,tool):
         if self.canvas.paste_item and tool!='paste':self.commit_paste()
@@ -815,7 +983,8 @@ class EditorWindow(QMainWindow):
             if action.isCheckable():action.setChecked(name==active)
         for name,button in self.brush_tool_buttons.items():
             button.setChecked(name==active)
-        names={'new':'Выделение сразу копирует картинку',
+        names={'cleanup_add':'Нарисуйте рамку пропущенной буквы',
+               'new':'Выделение сразу копирует картинку',
                'text_new':'Протяните отдельную рамку текста',
                'brush':'Кисть','restore':'Восстановление из оригинала',
                'smudge':'Мастихин','picker':'Пипетка',

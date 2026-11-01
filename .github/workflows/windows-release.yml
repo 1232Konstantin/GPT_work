@@ -47,13 +47,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = 'v0.5.1-preview.2'
+          $tag = 'v0.5.2-preview.1'
           $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_*_win64.exe | Select-Object -First 1
           if (-not $setup) { throw 'No setup file for preview release' }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $setup.FullName --clobber
           } else {
-            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.5.1 (unified Paint-style editor)'  --notes 'Unifies viewer, image editor and duplicate browser in one window. Independent editable text boxes, double-click to reopen text with per-zone font settings, separate text rectangle, image clipboard context menu, contextual Paint-style brush palette, enhanced tinted background inpainting. Offline and tested on Windows; visual review needed.' --prerelease
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.5.2 (approved glyph cleanup)'  --notes 'Focused cleanup update: inspect suggested glyph rectangles, toggle or add boxes, preview replacement before apply, modify only approved rectangles, block repeated cleanup, undo/redo tracked. Viewer and other editor features unchanged. Windows smoke tested; manual review needed.' --prerelease
           }
           if ($LASTEXITCODE -ne 0) { throw 'Preview release publication failed' }

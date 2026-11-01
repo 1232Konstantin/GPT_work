@@ -17,6 +17,8 @@ def gui_self_test(app):
         img=Image.new('RGB',(440,340),'#e6dfd1')
         draw=ImageDraw.Draw(img)
         draw.ellipse((75,30,360,300), fill='#fdfbf4',outline='#26292c',width=4)
+        for gx in (188,216,244):
+            draw.rectangle((gx,173,gx+11,201),fill='#161616')
         img.save(path)
         viewer=ViewerWindow();viewer.show()
         viewer.current=path
@@ -76,8 +78,44 @@ def gui_self_test(app):
                 raise RuntimeError('Rendering text corrupted pixels outside its bounds')
             if rendered.crop((145, 90, 255, 160)).tobytes() == editor.original.crop((145, 90, 255, 160)).tobytes():
                 raise RuntimeError('Translated text not drawn in selected area')
+            # Cleanup remains a suggestion until the user confirms boxes.
+            import numpy as np
+            editor._selected((170,155,116,68))
+            if not editor._cleanup_candidates:
+                raise RuntimeError('No glyph rectangles suggested for synthetic characters')
+            selected_count=sum(editor._cleanup_enabled)
+            editor._toggle_cleanup_box(0)
+            editor._toggle_cleanup_box(0)
+            if sum(editor._cleanup_enabled)!=selected_count:
+                raise RuntimeError('Clicking a glyph box must toggle its approval')
+            before=editor.working.copy()
+            boxes=[box for box,chosen in zip(editor._cleanup_candidates,editor._cleanup_enabled) if chosen]
+            editor.preview_cleanup()
+            if not editor._cleanup_preview_active or editor.working.tobytes()!=before.tobytes():
+                raise RuntimeError('Cleanup preview must not change working pixels')
+            editor.preview_cleanup()
+            if editor._cleanup_preview_active:
+                raise RuntimeError('Cleanup preview did not restore original view')
+            editor.clear_selection()
+            after=editor.working.copy()
+            if after.tobytes()==before.tobytes():
+                raise RuntimeError('Confirmed glyph cleanup made no change')
+            protected=np.ones((before.height,before.width),dtype=bool)
+            for x,y,w,h in boxes:protected[y:y+h,x:x+w]=False
+            if not np.array_equal(np.asarray(before)[protected],np.asarray(after)[protected]):
+                raise RuntimeError('Cleanup modified pixels outside confirmed rectangles')
+            editor.clear_selection()
+            if editor.working.tobytes()!=after.tobytes():
+                raise RuntimeError('Repeated cleanup must be a no-op')
+            editor.canvas.setFocus()
+            editor.undo()
+            if editor.working.tobytes()!=before.tobytes():
+                raise RuntimeError('Undo did not restore pixels before cleanup')
+            editor.redo()
+            if editor.working.tobytes()!=after.tobytes():
+                raise RuntimeError('Redo did not restore the approved cleanup')
             editor.dirty = False
-            print('GUI smoke test: one-window navigation, independent text layers, clipboard paste and compositing succeeded')
+            print('GUI smoke test: one-window mode, clipboard, text and safe repeatable cleanup succeeded')
         finally:
             editor.dirty=False
             viewer.close();app.processEvents()

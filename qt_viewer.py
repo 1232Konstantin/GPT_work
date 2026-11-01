@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QListWidget,
     QListWidgetItem, QLabel, QToolBar, QCheckBox, QComboBox, QPushButton,
     QFileDialog, QMessageBox, QDialog, QTreeWidget, QTreeWidgetItem, QHeaderView,
-    QProgressBar, QScrollArea, QFrame, QToolButton, QMenu)
+    QProgressBar, QScrollArea, QFrame, QToolButton, QMenu, QStackedWidget)
 
 from engine import open_image
 from viewer_core import discover_images, find_duplicates, sort_images, resample_for_display
@@ -206,6 +206,9 @@ class DuplicateDialog(QDialog):
         self.tree.itemDoubleClicked.connect(self._open)
         outer.addWidget(self.tree)
         outer.addWidget(QLabel('Двойной щелчок по файлу — открыть в просмотрщике. Удаление не производится.'))
+        back=QPushButton('← К изображению')
+        back.clicked.connect(self.reject)
+        outer.addWidget(back)
 
     def _open(self, item, _column):
         path = item.data(0, Qt.ItemDataRole.UserRole)
@@ -240,6 +243,14 @@ class ViewerWindow(QMainWindow):
         self.editor_windows = []
         self.thumbnail_cache: OrderedDict[Path, Image.Image] = OrderedDict()
         self._build_ui()
+        # All modes live in a single top-level window; keep the viewer alive
+        # while editing instead of creating a second editor window.
+        viewer_widget=self.takeCentralWidget()
+        self.mode_stack=QStackedWidget(self)
+        self.setCentralWidget(self.mode_stack)
+        self.mode_stack.addWidget(viewer_widget)
+        self.editor_by_path={}
+        self.dialog=None
         self.statusBar().showMessage('Откройте папку или изображение. Интернет не требуется.')
 
     def run_task(self, fn, done, *, failed=None, progress=None):
@@ -683,8 +694,14 @@ class ViewerWindow(QMainWindow):
             else:
                 self.refresh_list()
             # Keep dialog alive as modeless (no nested event-loop).
-            self.dialog = DuplicateDialog(result, self.select_path, self)
-            self.dialog.show()
+            if self.dialog is not None:
+                self.mode_stack.removeWidget(self.dialog)
+                self.dialog.deleteLater()
+            self.dialog=DuplicateDialog(result,self.select_path,self.mode_stack)
+            self.dialog.setWindowFlags(Qt.WindowType.Widget)
+            self.dialog.finished.connect(lambda _result:self._return_to_viewer())
+            self.mode_stack.addWidget(self.dialog)
+            self.mode_stack.setCurrentWidget(self.dialog)
         def fail(message):
             if generation != self.duplicate_generation:
                 return
@@ -704,12 +721,31 @@ class ViewerWindow(QMainWindow):
             self.dup_button.setEnabled(True)
             self.progress.setVisible(False)
 
+    def _return_to_viewer(self):
+        self.mode_stack.setCurrentIndex(0)
+        name=self.current.name if self.current else 'Просмотр изображений'
+        self.setWindowTitle(name+' — Manga Offline Translator')
+
     def open_editor(self):
-        if not self.current:
-            return
+        if not self.current:return
         from qt_editor import EditorWindow
-        editor = EditorWindow(self.current)
-        editor.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        editor.destroyed.connect(lambda: self.editor_windows.remove(editor) if editor in self.editor_windows else None)
-        self.editor_windows.append(editor)
-        editor.show()
+        editor=self.editor_by_path.get(self.current)
+        if editor is None:
+            editor=EditorWindow(self.current,self.mode_stack)
+            editor.return_to_viewer=self._return_to_viewer
+            self.mode_stack.addWidget(editor)
+            self.editor_by_path[self.current]=editor
+        self.mode_stack.setCurrentWidget(editor)
+        self.setWindowTitle('Редактор — '+self.current.name)
+
+    def closeEvent(self,event):
+        unsaved=[p.name for p,ed in self.editor_by_path.items() if ed.dirty]
+        if unsaved:
+            answer=QMessageBox.question(self,'Несохранённые изменения',
+                'Есть несохранённые правки: '+', '.join(unsaved[:3])+
+                ('…' if len(unsaved)>3 else '')+'. Закрыть без сохранения?',
+                QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer!=QMessageBox.StandardButton.Yes:
+                event.ignore();return
+        super().closeEvent(event)

@@ -94,7 +94,37 @@ def clear_letters(image: Image.Image, box: Box) -> tuple[Image.Image, int, Image
         return image.copy(), 0, Image.fromarray(mask, 'L')
     rgba = image.convert('RGBA')
     src = np.array(rgba.crop((x, y, x + w, y + h)))
-    repaired = cv2.inpaint(src[:, :, :3], mask, 4, cv2.INPAINT_TELEA)
+    # Inpainting must reconstruct the *local colour*, not inject white.
+    # A small local radius avoids sampling the opposite side of a balloon,
+    # which can be pure white even where the lettering sits on a tint.
+    repaired = cv2.inpaint(src[:, :, :3], mask, 3, cv2.INPAINT_TELEA)
+    gray = cv2.cvtColor(src[:, :, :3], cv2.COLOR_RGB2GRAY)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    for i in range(1, count):
+        x0, y0, cw, ch, _ = [int(v) for v in stats[i]]
+        border = max(4, min(12, max(cw, ch) // 4))
+        x1, y1 = max(0, x0-border), max(0, y0-border)
+        x2, y2 = min(w, x0+cw+border), min(h, y0+ch+border)
+        local_mask = mask[y1:y2, x1:x2]
+        background = src[y1:y2, x1:x2, :3][local_mask == 0]
+        if len(background) < 12:
+            continue
+        # Suppress bright halos only when the surrounding *non-text*
+        # background is clearly darker. Preserve gradients/textures otherwise.
+        bg_luma = background.astype(np.float32) @ np.array([.299, .587, .114])
+        typical = float(np.median(bg_luma))
+        area = repaired[y1:y2, x1:x2]
+        zone = (labels[y1:y2, x1:x2] == i)
+        if not np.any(zone):
+            continue
+        lum = area[zone].astype(np.float32) @ np.array([.299, .587, .114])
+        if typical < 244:
+            excessive = lum > typical + 18
+            if np.any(excessive):
+                current = area[zone].astype(np.float32)
+                excess = np.maximum(0., (lum-typical-7.)[excessive])
+                current[excessive] = np.clip(current[excessive] - excess[:, None], 0, 255)
+                area[zone] = current.astype(np.uint8)
     src[mask > 0, :3] = repaired[mask > 0, :3]
     output = rgba.copy()
     output.paste(Image.fromarray(src, 'RGBA'), (x, y))

@@ -46,3 +46,19 @@ def test_smudge_only_local_and_does_not_change_source():
     assert result.tobytes()!=im.tobytes()
     assert im.getpixel((39,28))==(255,255,255)
     assert result.getpixel((70,70))==im.getpixel((70,70))
+
+def test_cleaning_preserves_tinted_background_not_whitewash():
+    """The repair must look like its beige surroundings, not white paint."""
+    background=(215,187,144)
+    original=Image.new('RGB',(200,135),background)
+    dr=ImageDraw.Draw(original)
+    for x in (55,75,95,115):
+        dr.rectangle((x,45,x+7,72),fill='#151515')
+    repaired,count,mask=clear_letters(original,(36,30,111,63))
+    assert count>0
+    visible=np.asarray(repaired)
+    selected=np.asarray(mask)>0
+    region=visible[30:93,36:147]
+    assert np.median(region[selected,0])<242, 'Erased lettering must not turn pure white'
+    assert np.mean(np.abs(region[selected].astype(float)-np.array(background)))<48
+    assert repaired.getpixel((0,0))==background

@@ -90,20 +90,29 @@ def gui_self_test(app):
                 raise RuntimeError('Clicking a glyph box must toggle its approval')
             before=editor.working.copy()
             boxes=[box for box,chosen in zip(editor._cleanup_candidates,editor._cleanup_enabled) if chosen]
-            editor.preview_cleanup()
+            editor.preview_button.click()
             if not editor._cleanup_preview_active or editor.working.tobytes()!=before.tobytes():
                 raise RuntimeError('Cleanup preview must not change working pixels')
-            editor.preview_cleanup()
-            if editor._cleanup_preview_active:
-                raise RuntimeError('Cleanup preview did not restore original view')
-            editor.clear_selection()
+            shown=editor.canvas.current_image.tobytes()
+            if shown==before.tobytes():
+                raise RuntimeError('Preview itself did not show any cleanup')
+            # Crucially, click the ACTUAL QPushButton while PREVIEW IS SHOWN.
+            if not editor.clear_button.isEnabled():
+                raise RuntimeError('Apply button disabled while approved boxes are present')
+            editor.clear_button.click()
             after=editor.working.copy()
-            if after.tobytes()==before.tobytes():
-                raise RuntimeError('Confirmed glyph cleanup made no change')
+            if after.tobytes()!=shown:
+                raise RuntimeError('Clicking Apply must commit EXACTLY what preview displayed')
+            if editor.canvas.current_image.tobytes()!=after.tobytes():
+                raise RuntimeError('Qt canvas kept showing the old image after Apply')
+            if editor.canvas.pixmap_item.pixmap().size().width()!=editor.working.width:
+                raise RuntimeError('Pixmap geometry is not updated after applying cleanup')
             protected=np.ones((before.height,before.width),dtype=bool)
             for x,y,w,h in boxes:protected[y:y+h,x:x+w]=False
             if not np.array_equal(np.asarray(before)[protected],np.asarray(after)[protected]):
                 raise RuntimeError('Cleanup modified pixels outside confirmed rectangles')
+            if editor.clear_button.isEnabled():
+                raise RuntimeError('Apply must disable itself after successful cleanup')
             editor.clear_selection()
             if editor.working.tobytes()!=after.tobytes():
                 raise RuntimeError('Repeated cleanup must be a no-op')

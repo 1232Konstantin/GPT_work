@@ -491,6 +491,9 @@ class EditorWindow(QMainWindow):
         self._cleanup_done_boxes=[]
         self._cleanup_done_selections=set()
         self._cleanup_preview_active=False
+        self._cleanup_preview_image=None
+        self._cleanup_preview_boxes=()
+        self._cleanup_preview_base=None
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._refresh_pixmap)
@@ -753,7 +756,7 @@ class EditorWindow(QMainWindow):
         self._in_sync=False
 
     def _selected(self,box):
-        self._stop_cleanup_preview()
+        self._invalidate_cleanup_preview()
         self.commit_paste()
         self.selection=clip_box(box,self.working.size)
         self.canvas.set_selection(self.selection)
@@ -881,7 +884,18 @@ class EditorWindow(QMainWindow):
                                        for done in self._cleanup_done_boxes)]
         if not allowed:
             return
-        preview,_=remove_glyphs(self.working,allowed)
+        boxes=tuple(allowed)
+        # Keep exactly the image shown to the user. Apply must commit THIS
+        # image, never start a second independently calculated cleanup.
+        if (self._cleanup_preview_image is not None
+                and self._cleanup_preview_base is self.working
+                and self._cleanup_preview_boxes == boxes):
+            preview=self._cleanup_preview_image
+        else:
+            preview,_=remove_glyphs(self.working,boxes)
+            self._cleanup_preview_image=preview
+            self._cleanup_preview_boxes=boxes
+            self._cleanup_preview_base=self.working
         self._cleanup_preview_active=True
         self.canvas.set_cleanup_boxes([],[])
         self.canvas.set_picture(preview)
@@ -892,8 +906,14 @@ class EditorWindow(QMainWindow):
             self._cleanup_preview_active=False
             self.canvas.set_picture(self.working)
 
-    def detect_cleanup(self):
+    def _invalidate_cleanup_preview(self):
         self._stop_cleanup_preview()
+        self._cleanup_preview_image=None
+        self._cleanup_preview_boxes=()
+        self._cleanup_preview_base=None
+
+    def detect_cleanup(self):
+        self._invalidate_cleanup_preview()
         if self.selection is None:
             self.cleanup_stats.setText('Сначала выделите надпись.')
             return
@@ -920,13 +940,13 @@ class EditorWindow(QMainWindow):
         return x<xx+ww and x+w>xx and y<yy+hh and y+h>yy
 
     def _toggle_cleanup_box(self,index):
-        self._stop_cleanup_preview()
+        self._invalidate_cleanup_preview()
         if not 0<=index<len(self._cleanup_enabled):return
         self._cleanup_enabled[index]=not self._cleanup_enabled[index]
         self._refresh_cleanup_overlay()
 
     def _manual_cleanup_box(self,box):
-        self._stop_cleanup_preview()
+        self._invalidate_cleanup_preview()
         if self.selection is None:
             self.statusBar().showMessage('Сначала выделите надпись.',6000)
             self.set_tool('new')
@@ -944,7 +964,8 @@ class EditorWindow(QMainWindow):
         self.set_tool('new')
 
     def clear_selection(self):
-        self._stop_cleanup_preview()
+        # The PREVIEW is the transaction's exact proposed result. If a user
+        # saw a cleaned image, clicking Apply must retain that same image.
         if self.selection is None:
             self.statusBar().showMessage('Сначала выделите прямоугольную область.',6000)
             return
@@ -952,26 +973,36 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage('Уже очищено. Повторное нажатие ничего не изменяет.',6500)
             return
         self.commit_paste()
-        approved=[box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
-                  if active and not any(self._boxes_overlap(box,done)
-                                        for done in self._cleanup_done_boxes)]
+        approved=tuple(box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
+                       if active and not any(self._boxes_overlap(box,done)
+                                            for done in self._cleanup_done_boxes))
         if not approved:
-            self.statusBar().showMessage('Нет подтверждённых рамок для очистки.',6500)
+            self.statusBar().showMessage('Нет отмеченных рамок для очистки.',6500)
             return
-        result,count=remove_glyphs(self.working,approved)
-        if not count:
-            self.statusBar().showMessage('Изменений нет.',6500)
+        if (self._cleanup_preview_image is not None
+                and self._cleanup_preview_base is self.working
+                and self._cleanup_preview_boxes == approved):
+            result=self._cleanup_preview_image.copy()
+            count=sum(w*h for x,y,w,h in approved)
+        else:
+            result,count=remove_glyphs(self.working,approved)
+        if not count or result.tobytes()==self.working.tobytes():
+            self.statusBar().showMessage('Очистка не дала изменений. Попробуйте другую рамку.',6500)
             return
         self._checkpoint()
         self.working=result
         self._cleanup_done_boxes.extend(approved)
         self._cleanup_done_selections.add(self.selection)
+        self._cleanup_preview_active=False
+        self._cleanup_preview_image=None
+        self._cleanup_preview_base=None
+        self._cleanup_preview_boxes=()
         self._cleanup_candidates=[]
         self._cleanup_enabled=[]
         self._sync()
         self._refresh_cleanup_overlay()
         self.statusBar().showMessage(
-            f'Обработано {len(approved)} рамок. Вне рамок ни один пиксель не изменён. Ctrl+Z — отменить.',9000)
+            f'Применён результат предпросмотра ({len(approved)} рамок). Ctrl+Z — отменить.',9000)
 
     def set_tool(self,tool):
         if self.canvas.paste_item and tool!='paste':self.commit_paste()

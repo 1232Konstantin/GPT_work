@@ -732,6 +732,9 @@ class ViewerWindow(QMainWindow):
         editor=self.editor_by_path.get(self.current)
         if editor is None:
             editor=EditorWindow(self.current,self.mode_stack)
+            # QMainWindow defaults to Qt.Window on some Qt versions even
+            # with a parent. Force it to be a regular embedded widget.
+            editor.setWindowFlags(Qt.WindowType.Widget)
             editor.return_to_viewer=self._return_to_viewer
             self.mode_stack.addWidget(editor)
             self.editor_by_path[self.current]=editor

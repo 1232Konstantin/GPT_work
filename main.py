@@ -38,6 +38,8 @@ def gui_self_test(app):
             assert editor.canvas.tool=='new', 'Editor must start in manual rectangle mode'
             # Full paint-style editor smoke: rectangle goes to image clipboard,
             # text stays inside its box, other pixels remain unchanged.
+            print('Single-window diagnostic:',viewer.mode_stack.currentWidget() is editor,
+                  'editor.isWindow=',editor.isWindow(),flush=True)
             if viewer.mode_stack.currentWidget() is not editor or editor.isWindow():
                 raise RuntimeError('Editor must open inside the same top-level window')
             editor._selected((130, 80, 125, 80))

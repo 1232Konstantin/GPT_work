@@ -80,15 +80,28 @@ def gui_self_test(app):
                 raise RuntimeError('Translated text not drawn in selected area')
             # Cleanup remains a suggestion until the user confirms boxes.
             import numpy as np
+            editor.cleanup_mode.setCurrentIndex(2) # outlined text
+            editor.cleanup_grow.setValue(2)
             editor._selected((170,155,116,68))
             if not editor._cleanup_candidates:
-                raise RuntimeError('No glyph rectangles suggested for synthetic characters')
+                raise RuntimeError('No contrast components suggested for synthetic characters')
             selected_count=sum(editor._cleanup_enabled)
+            full_mask=editor._approved_cleanup_mask()
+            if not np.any(full_mask) or editor.canvas.cleanup_mask_item is None:
+                raise RuntimeError('No visible pixel mask constructed')
             editor._toggle_cleanup_box(0)
+            if np.count_nonzero(editor._approved_cleanup_mask()) >= np.count_nonzero(full_mask):
+                raise RuntimeError('Disabling a component did not remove pixels from mask')
+            # Changing the repair method must preserve the user's decisions.
+            editor.cleanup_method.setCurrentIndex(1)
+            if editor._cleanup_enabled[0] or sum(editor._cleanup_enabled)!=selected_count-1:
+                raise RuntimeError('Changing repair method reset approved regions')
+            editor.cleanup_method.setCurrentIndex(0)
             editor._toggle_cleanup_box(0)
-            if sum(editor._cleanup_enabled)!=selected_count:
-                raise RuntimeError('Clicking a glyph box must toggle its approval')
+            if not np.array_equal(full_mask,editor._approved_cleanup_mask()):
+                raise RuntimeError('Enabling a component did not restore original mask')
             before=editor.working.copy()
+            mask=editor._approved_cleanup_mask().copy()
             boxes=[box for box,chosen in zip(editor._cleanup_candidates,editor._cleanup_enabled) if chosen]
             editor.preview_button.click()
             if not editor._cleanup_preview_active or editor.working.tobytes()!=before.tobytes():
@@ -111,6 +124,10 @@ def gui_self_test(app):
             for x,y,w,h in boxes:protected[y:y+h,x:x+w]=False
             if not np.array_equal(np.asarray(before)[protected],np.asarray(after)[protected]):
                 raise RuntimeError('Cleanup modified pixels outside confirmed rectangles')
+            if not np.array_equal(np.asarray(before)[mask==0],np.asarray(after)[mask==0]):
+                raise RuntimeError('Cleanup modified any pixels outside its fine-grained ink mask')
+            if not np.array_equal(editor._cleanup_last_applied_mask,mask):
+                raise RuntimeError('Applied mask differs from previewed selection')
             if editor.clear_button.isEnabled():
                 raise RuntimeError('Apply must disable itself after successful cleanup')
             editor.clear_selection()
@@ -124,7 +141,7 @@ def gui_self_test(app):
             if editor.working.tobytes()!=after.tobytes():
                 raise RuntimeError('Redo did not restore the approved cleanup')
             editor.dirty = False
-            print('GUI smoke test: one-window mode, clipboard, text and safe repeatable cleanup succeeded')
+            print('GUI smoke test: contrast pixel mask, exclusion, mode selection, preview/application and undo/redo succeeded')
         finally:
             editor.dirty=False
             viewer.close();app.processEvents()

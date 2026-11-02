@@ -12,6 +12,8 @@ from pathlib import Path
 import json
 
 from PIL import Image
+import numpy as np
+import cv2
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import (QAction, QColor, QFont, QPainter, QPen, QBrush,
                            QImage, QKeySequence, QTextDocument, QTextOption)
@@ -20,11 +22,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsItem,
     QPushButton, QToolButton, QToolBar, QPlainTextEdit, QSpinBox,
     QFontComboBox, QColorDialog, QFileDialog, QMessageBox, QFrame,
-    QMenu, QStackedWidget, QSlider, QButtonGroup)
+    QMenu, QStackedWidget, QSlider, QButtonGroup, QComboBox)
 
 from engine import open_image
 from paint_core import clip_box, brush_segment, palette_smudge
-from cleanup_core import detect_glyph_boxes, remove_glyphs
+from contrast_cleanup import segment_ink, repair_background, mask_components, confirmed_mask
 from qt_common import pixmap_from_pil, Task
 
 
@@ -122,6 +124,7 @@ class ImageCanvas(QGraphicsView):
         self.pixmap_item = None
         self.selected_item = None
         self.cleanup_items = []
+        self.cleanup_mask_item = None
         self.cleanup_boxes = []
         self.cleanup_enabled = []
         self.text_items = []
@@ -272,6 +275,28 @@ class ImageCanvas(QGraphicsView):
             outline.setZValue(55)
             outline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.cleanup_items.append(outline)
+
+    def set_cleanup_mask(self, mask: np.ndarray | None, box):
+        # Overlay only *actual writable pixels*. Its own item has no mouse
+        # interaction; rectangle toggles still go to ImageCanvas.mousePressEvent.
+        if self.cleanup_mask_item is not None:
+            self.scene().removeItem(self.cleanup_mask_item)
+            self.cleanup_mask_item = None
+        if mask is None or box is None:
+            return
+        x,y,w,h=clip_box(box,(mask.shape[1],mask.shape[0]))
+        if w<=0 or h<=0:
+            return
+        roi=np.asarray(mask[y:y+h,x:x+w])>0
+        if not np.any(roi):
+            return
+        rgba=np.zeros((h,w,4),dtype=np.uint8)
+        rgba[roi]=[255,55,95,125]
+        item=self.scene().addPixmap(pixmap_from_pil(Image.fromarray(rgba,'RGBA')))
+        item.setPos(x,y)
+        item.setZValue(50)
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.cleanup_mask_item=item
 
     def set_text_layers(self, layers: list[TextLayer], selected: int):
         for frame in self.text_items:
@@ -494,6 +519,12 @@ class EditorWindow(QMainWindow):
         self._cleanup_preview_image=None
         self._cleanup_preview_boxes=()
         self._cleanup_preview_base=None
+        self._cleanup_preview_mask=None
+        self._cleanup_preview_method=None
+        self._cleanup_base_mask=None
+        self._cleanup_region=None
+        self._cleanup_labels=None
+        self._cleanup_label_ids=[]
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._refresh_pixmap)
@@ -524,9 +555,32 @@ class EditorWindow(QMainWindow):
         sel.addWidget(QLabel('1. Выделите фрагмент изображения'))
         sel.addWidget(QLabel('2. Вставьте его в переводчик'))
         sel.addWidget(QLabel('3. Очистите буквы или исправьте кистью'))
-        help_label=QLabel('Зелёные рамки — будут очищены, серые — исключены. Щелчком меняйте отметку.')
+        help_label=QLabel('Розовые пиксели — маска очистки. Зелёные рамки включены; серые исключены. Щелчок переключает.')
         help_label.setWordWrap(True)
         sel.addWidget(help_label)
+        sel.addWidget(QLabel('Тип текста'))
+        self.cleanup_mode=QComboBox()
+        self.cleanup_mode.addItem('Обычный: тёмный', 'dark')
+        self.cleanup_mode.addItem('Обычный: светлый', 'light')
+        self.cleanup_mode.addItem('Контурный (светлая обводка)', 'outline')
+        self.cleanup_mode.setCurrentIndex(2)
+        self.cleanup_mode.currentIndexChanged.connect(self._cleanup_parameters_changed)
+        sel.addWidget(self.cleanup_mode)
+        sel.addWidget(QLabel('Восстановление фона'))
+        self.cleanup_method=QComboBox()
+        self.cleanup_method.addItem('Telea — текстура и градиенты', 'telea')
+        self.cleanup_method.addItem('Линейный градиент', 'plane')
+        self.cleanup_method.addItem('Квадратичный градиент', 'quadratic')
+        self.cleanup_method.currentIndexChanged.connect(self._cleanup_repair_changed)
+        sel.addWidget(self.cleanup_method)
+        grow_row=QHBoxLayout()
+        grow_row.addWidget(QLabel('Край штриха'))
+        self.cleanup_grow=QSpinBox()
+        self.cleanup_grow.setRange(0,3)
+        self.cleanup_grow.setValue(2)
+        self.cleanup_grow.valueChanged.connect(self._cleanup_parameters_changed)
+        grow_row.addWidget(self.cleanup_grow)
+        sel.addLayout(grow_row)
         self.cleanup_stats=QLabel('Выделите надпись.')
         sel.addWidget(self.cleanup_stats)
         self.detect_button=QPushButton('Найти буквы')
@@ -860,45 +914,35 @@ class EditorWindow(QMainWindow):
             self.selection=None;self.canvas.set_selection(None)
         self.set_tool('new')
 
+    def _approved_cleanup_mask(self):
+        if self._cleanup_base_mask is None or self._cleanup_labels is None:
+            return np.zeros((self.working.height,self.working.width),dtype=np.uint8)
+        return confirmed_mask(self._cleanup_base_mask,self._cleanup_region,
+                              self._cleanup_labels,self._cleanup_label_ids,
+                              self._cleanup_candidates,self._cleanup_enabled)
+
     def _refresh_cleanup_overlay(self):
-        if not self._cleanup_preview_active:
-            self.canvas.set_cleanup_boxes(self._cleanup_candidates,self._cleanup_enabled)
         enabled=sum(self._cleanup_enabled)
         self.cleanup_stats.setText(
-            f'Найдено рамок: {len(self._cleanup_candidates)}. Отмечено: {enabled}.')
+            f'Найдено объектов: {len(self._cleanup_candidates)}. Отмечено: {enabled}.')
         self.clear_button.setEnabled(enabled>0)
         self.preview_button.setEnabled(enabled>0)
-        self.preview_button.setText('Вернуться к оригиналу' if self._cleanup_preview_active
-                                    else 'Предпросмотр результата')
-
-    def preview_cleanup(self):
+        self.preview_button.setText(
+            'Вернуться к исходнику' if self._cleanup_preview_active
+            else 'Предпросмотр очистки')
         if self._cleanup_preview_active:
-            self._cleanup_preview_active=False
-            self.canvas.set_picture(self.working)
-            self._refresh_cleanup_overlay()
-            return
-        if not any(self._cleanup_enabled):
-            return
-        allowed=[box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
-                 if active and not any(self._boxes_overlap(box,done)
-                                       for done in self._cleanup_done_boxes)]
-        if not allowed:
-            return
-        boxes=tuple(allowed)
-        # Keep exactly the image shown to the user. Apply must commit THIS
-        # image, never start a second independently calculated cleanup.
-        if (self._cleanup_preview_image is not None
-                and self._cleanup_preview_base is self.working
-                and self._cleanup_preview_boxes == boxes):
-            preview=self._cleanup_preview_image
+            self.canvas.set_cleanup_boxes([],[])
+            self.canvas.set_cleanup_mask(None,None)
         else:
-            preview,_=remove_glyphs(self.working,boxes)
-            self._cleanup_preview_image=preview
-            self._cleanup_preview_boxes=boxes
-            self._cleanup_preview_base=self.working
-        self._cleanup_preview_active=True
-        self.canvas.set_cleanup_boxes([],[])
-        self.canvas.set_picture(preview)
+            self.canvas.set_cleanup_boxes(self._cleanup_candidates,self._cleanup_enabled)
+            self.canvas.set_cleanup_mask(self._approved_cleanup_mask(),self.selection)
+
+    def _cleanup_parameters_changed(self,*_):
+        if self.selection is not None and self.selection not in self._cleanup_done_selections:
+            self.detect_cleanup()
+
+    def _cleanup_repair_changed(self,*_):
+        self._invalidate_cleanup_preview()
         self._refresh_cleanup_overlay()
 
     def _stop_cleanup_preview(self):
@@ -909,8 +953,9 @@ class EditorWindow(QMainWindow):
     def _invalidate_cleanup_preview(self):
         self._stop_cleanup_preview()
         self._cleanup_preview_image=None
-        self._cleanup_preview_boxes=()
         self._cleanup_preview_base=None
+        self._cleanup_preview_mask=None
+        self._cleanup_preview_method=None
 
     def detect_cleanup(self):
         self._invalidate_cleanup_preview()
@@ -920,18 +965,28 @@ class EditorWindow(QMainWindow):
         if self.selection in self._cleanup_done_selections:
             self._cleanup_candidates=[]
             self._cleanup_enabled=[]
+            self._cleanup_base_mask=None
+            self._cleanup_labels=None
+            self._cleanup_label_ids=[]
             self._refresh_cleanup_overlay()
             self.cleanup_stats.setText('Область уже очищена. Ctrl+Z — отменить.')
             return
-        # Only show candidate rectangles; do not modify the image here.
-        boxes=detect_glyph_boxes(self.working,self.selection)
-        self._cleanup_candidates=boxes
+        # No OCR: contrast segmentation on a background-dominated rectangle.
+        # Each connected component is a candidate for explicit user approval.
+        seg=segment_ink(self.working,self.selection,
+                        mode=self.cleanup_mode.currentData(),
+                        grow=self.cleanup_grow.value())
+        self._cleanup_base_mask=seg.mask
+        (self._cleanup_region,self._cleanup_candidates,
+         self._cleanup_label_ids,self._cleanup_labels)=mask_components(
+            seg.mask,self.selection)
         self._cleanup_enabled=[
             not any(self._boxes_overlap(box,done) for done in self._cleanup_done_boxes)
-            for box in boxes]
+            for box in self._cleanup_candidates]
         self._refresh_cleanup_overlay()
-        if not boxes:
-            self.statusBar().showMessage('Буквы не найдены. Добавьте рамки вручную.',6500)
+        if not self._cleanup_candidates:
+            self.statusBar().showMessage(
+                'Контрастные объекты не найдены. Можно добавить рамку вручную.',6500)
 
     @staticmethod
     def _boxes_overlap(a,b):
@@ -941,7 +996,8 @@ class EditorWindow(QMainWindow):
 
     def _toggle_cleanup_box(self,index):
         self._invalidate_cleanup_preview()
-        if not 0<=index<len(self._cleanup_enabled):return
+        if not 0<=index<len(self._cleanup_enabled):
+            return
         self._cleanup_enabled[index]=not self._cleanup_enabled[index]
         self._refresh_cleanup_overlay()
 
@@ -953,58 +1009,93 @@ class EditorWindow(QMainWindow):
             return
         x,y,w,h=box
         sx,sy,sw,sh=self.selection
-        left=max(x,sx)
-        top=max(y,sy)
-        right=min(x+w,sx+sw)
-        bottom=min(y+h,sy+sh)
-        if right-left>=3 and bottom-top>=3:
+        left=max(x,sx);top=max(y,sy)
+        right=min(x+w,sx+sw);bottom=min(y+h,sy+sh)
+        if right-left>=3 and bottom-top>=3 and self._cleanup_labels is not None:
+            # Explicitly drawn boxes may cover all pixels inside their bounds.
+            # Suggested automatic boxes only cover their actual ink pixels.
             self._cleanup_candidates.append((left,top,right-left,bottom-top))
+            self._cleanup_label_ids.append(None)
             self._cleanup_enabled.append(True)
             self._refresh_cleanup_overlay()
         self.set_tool('new')
 
-    def clear_selection(self):
-        # The PREVIEW is the transaction's exact proposed result. If a user
-        # saw a cleaned image, clicking Apply must retain that same image.
-        if self.selection is None:
-            self.statusBar().showMessage('Сначала выделите прямоугольную область.',6000)
+    def preview_cleanup(self):
+        if self._cleanup_preview_active:
+            self._stop_cleanup_preview()
+            self._refresh_cleanup_overlay()
             return
-        if self.selection in self._cleanup_done_selections:
-            self.statusBar().showMessage('Уже очищено. Повторное нажатие ничего не изменяет.',6500)
+        mask=self._approved_cleanup_mask()
+        if not np.any(mask):
             return
-        self.commit_paste()
-        approved=tuple(box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
-                       if active and not any(self._boxes_overlap(box,done)
-                                            for done in self._cleanup_done_boxes))
-        if not approved:
-            self.statusBar().showMessage('Нет отмеченных рамок для очистки.',6500)
-            return
+        method=self.cleanup_method.currentData()
         if (self._cleanup_preview_image is not None
                 and self._cleanup_preview_base is self.working
-                and self._cleanup_preview_boxes == approved):
-            result=self._cleanup_preview_image.copy()
-            count=sum(w*h for x,y,w,h in approved)
+                and self._cleanup_preview_method==method
+                and np.array_equal(mask,self._cleanup_preview_mask)):
+            preview=self._cleanup_preview_image
         else:
-            result,count=remove_glyphs(self.working,approved)
-        if not count or result.tobytes()==self.working.tobytes():
-            self.statusBar().showMessage('Очистка не дала изменений. Попробуйте другую рамку.',6500)
+            preview=repair_background(self.working,mask,method)
+            self._cleanup_preview_image=preview
+            self._cleanup_preview_base=self.working
+            self._cleanup_preview_mask=mask.copy()
+            self._cleanup_preview_method=method
+        self._cleanup_preview_active=True
+        self.canvas.set_cleanup_boxes([],[])
+        self.canvas.set_cleanup_mask(None,None)
+        self.canvas.set_picture(preview)
+        self._refresh_cleanup_overlay()
+
+    def clear_selection(self):
+        if self.selection is None:
+            self.statusBar().showMessage('Сначала выделите надпись.',6000)
             return
+        if self.selection in self._cleanup_done_selections:
+            self.statusBar().showMessage(
+                'Эта область уже очищена. Повторное применение заблокировано.',6500)
+            return
+        mask=self._approved_cleanup_mask()
+        if not np.any(mask):
+            self.statusBar().showMessage('Нет отмеченных пикселей для удаления.',6500)
+            return
+        method=self.cleanup_method.currentData()
+        if (self._cleanup_preview_image is not None
+                and self._cleanup_preview_base is self.working
+                and self._cleanup_preview_method==method
+                and np.array_equal(mask,self._cleanup_preview_mask)):
+            result=self._cleanup_preview_image.copy()
+        else:
+            result=repair_background(self.working,mask,method)
+        if result.tobytes()==self.working.tobytes():
+            self.statusBar().showMessage('Очистка не изменила изображение.',6500)
+            return
+        # Invariant: only the approved pixel mask can differ from the source.
+        before=np.asarray(self.working.convert('RGBA'))
+        after=np.asarray(result.convert('RGBA'))
+        if np.any(before[mask==0]!=after[mask==0]):
+            raise RuntimeError('Cleanup attempted to change protected image pixels')
         self._checkpoint()
         self.working=result
+        self._cleanup_last_applied_mask=mask.copy()
+        approved=[box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
+                  if active]
         self._cleanup_done_boxes.extend(approved)
         self._cleanup_done_selections.add(self.selection)
-        self._cleanup_preview_active=False
-        self._cleanup_preview_image=None
-        self._cleanup_preview_base=None
-        self._cleanup_preview_boxes=()
+        self._invalidate_cleanup_preview()
         self._cleanup_candidates=[]
         self._cleanup_enabled=[]
+        self._cleanup_label_ids=[]
+        self._cleanup_base_mask=None
+        self._cleanup_labels=None
         self._sync()
         self._refresh_cleanup_overlay()
         self.statusBar().showMessage(
-            f'Применён результат предпросмотра ({len(approved)} рамок). Ctrl+Z — отменить.',9000)
+            f'Очищено {np.count_nonzero(mask)} пикселей в {len(approved)} объектах. Ctrl+Z — отменить.',9000)
 
     def set_tool(self,tool):
+        if self._cleanup_preview_active and tool not in ('new','cleanup_add'):
+            self._stop_cleanup_preview()
+            self._refresh_cleanup_overlay()
         if self.canvas.paste_item and tool!='paste':self.commit_paste()
         self.canvas.set_tool(tool)
         section=2 if tool in ('brush','restore','smudge','picker') else (1 if tool in ('text','text_new') else 0)

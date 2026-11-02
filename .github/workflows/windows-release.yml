@@ -47,13 +47,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = 'v0.5.3-preview.1'
+          $tag = 'v0.6.0-preview.1'
           $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_*_win64.exe | Select-Object -First 1
           if (-not $setup) { throw 'No setup file for preview release' }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $setup.FullName --clobber
           } else {
-            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.5.3 (preview-to-apply fix)'  --notes 'Fix cleanup Apply: the visible preview is now committed verbatim. Windows GUI smoke explicitly clicks the real Preview and Apply buttons and verifies that the displayed and saved image agree. No viewer/brush/text changes.' --prerelease
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.6.0 (contrast pixel-mask cleanup)'  --notes 'Contrast-based pixel cleanup without OCR. Dark, light and outlined glyph modes, component exclusion, explicit manual regions, pixel-mask overlay, edge expansion, Telea/linear/quadratic background restoration. Preview and actual Apply match. Strict outside-mask pixel invariant, Windows installed GUI smoke. Viewer unchanged.' --prerelease
           }
           if ($LASTEXITCODE -ne 0) { throw 'Preview release publication failed' }

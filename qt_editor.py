@@ -14,20 +14,23 @@ import json
 from PIL import Image
 import numpy as np
 import cv2
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSettings, QThreadPool, QTimer
+from PySide6.QtCore import Qt, QRectF, QPointF, QSize, Signal, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import (QAction, QColor, QFont, QPainter, QPen, QBrush,
-                           QImage, QKeySequence, QTextDocument, QTextOption)
+                           QImage, QPixmap, QKeySequence, QTextDocument, QTextOption)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QSplitter, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsItem,
     QPushButton, QToolButton, QToolBar, QPlainTextEdit, QSpinBox,
     QFontComboBox, QColorDialog, QFileDialog, QMessageBox, QFrame,
-    QMenu, QStackedWidget, QSlider, QButtonGroup, QComboBox)
+    QMenu, QStackedWidget, QSlider, QButtonGroup, QComboBox,
+    QGridLayout, QDialog, QDialogButtonBox, QFormLayout, QScrollArea)
 
 from engine import open_image
 from paint_core import clip_box, brush_segment, palette_smudge
 from contrast_cleanup import segment_ink, repair_background, mask_components, confirmed_mask
 from qt_common import pixmap_from_pil, Task
+from qt_brush_icons import brush_icon, picker_cursor_pixmap
+from paint3d_tools import draw_stroke, TOOLS as PAINT_TOOLS
 
 
 @dataclass
@@ -39,6 +42,8 @@ class TextLayer:
     color: str = '#202020'
     bold: bool = False
     italic: bool = False
+    underline: bool = False
+    alignment: str = 'left'
 
 
 def font_for(layer: TextLayer) -> QFont:
@@ -46,7 +51,18 @@ def font_for(layer: TextLayer) -> QFont:
     f.setPixelSize(layer.size)  # image pixels, not device-dependent points
     f.setBold(layer.bold)
     f.setItalic(layer.italic)
+    f.setUnderline(layer.underline)
     return f
+
+
+def text_option(layer: TextLayer) -> QTextOption:
+    opt=QTextOption()
+    opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    opt.setAlignment({'left':Qt.AlignmentFlag.AlignLeft,
+                      'center':Qt.AlignmentFlag.AlignHCenter,
+                      'right':Qt.AlignmentFlag.AlignRight}.get(
+                          layer.alignment,Qt.AlignmentFlag.AlignLeft))
+    return opt
 
 
 def qimage_from_pil(image: Image.Image) -> QImage:
@@ -75,9 +91,7 @@ def composite_text(image: Image.Image, layers: list[TextLayer]) -> Image.Image:
         doc = QTextDocument()
         doc.setDocumentMargin(0)
         doc.setDefaultFont(font_for(layer))
-        option = QTextOption()
-        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-        doc.setDefaultTextOption(option)
+        doc.setDefaultTextOption(text_option(layer))
         doc.setPlainText(layer.text)
         doc.setTextWidth(max(1, w - 6))
         painter.save()
@@ -106,6 +120,7 @@ class ImageCanvas(QGraphicsView):
     text_edited = Signal(str)
     text_layer_selected = Signal(int)
     paste_moved = Signal()
+    paste_confirmed = Signal()
     text_rectangle_requested = Signal(object)
     context_menu_requested = Signal(object)
     cleanup_box_toggled = Signal(int)
@@ -141,6 +156,14 @@ class ImageCanvas(QGraphicsView):
         self.drag_box = None
         self.temp_item = None
         self.brush_size = 18
+        self.paste_resize_start = None
+        self.paste_resize_scale = 1.0
+        self.picker_preview_item = self.scene().addPixmap(QPixmap())
+        self.picker_preview_item.setZValue(100)
+        self.picker_preview_item.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.picker_preview_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.picker_preview_item.hide()
         self._updating_text = False
         self._source_pixmap = None
         self._view_generation = 0
@@ -235,6 +258,10 @@ class ImageCanvas(QGraphicsView):
         self.tool = tool
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag
                          if tool == 'pan' else QGraphicsView.DragMode.NoDrag)
+        self.setCursor(Qt.CursorShape.CrossCursor if tool == 'picker'
+                       else Qt.CursorShape.ArrowCursor)
+        if tool != 'picker':
+            self.picker_preview_item.hide()
         if self.text_edit_item is not None:
             self.text_edit_item.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextEditorInteraction if tool == 'text'
@@ -322,9 +349,7 @@ class ImageCanvas(QGraphicsView):
             content.setDefaultTextColor(QColor(layer.color))
             content.document().setDocumentMargin(0)
             content.setTextWidth(max(1, w-6))
-            option = QTextOption()
-            option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-            content.document().setDefaultTextOption(option)
+            content.document().setDefaultTextOption(text_option(layer))
             content.setPlainText(layer.text)
             content.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextEditorInteraction if active and self.tool=='text'
@@ -351,6 +376,7 @@ class ImageCanvas(QGraphicsView):
             item.setFont(font_for(layer))
             item.setDefaultTextColor(QColor(layer.color))
             item.setTextWidth(max(1, layer.box[2] - 6))
+            item.document().setDefaultTextOption(text_option(layer))
         finally:
             self._updating_text = False
 
@@ -365,18 +391,33 @@ class ImageCanvas(QGraphicsView):
         item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         item.setSelected(True)
         self.paste_item = item
+        self.paste_source = image.copy()
         self.set_tool('paste')
 
     def cancel_paste(self):
         if self.paste_item:
             self.scene().removeItem(self.paste_item)
             self.paste_item = None
+        self.paste_source = None
 
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event); return
-        if self.tool == 'pan' or self.tool == 'paste':
+        if self.tool == 'pan':
             super().mousePressEvent(event); return
+        if self.tool == 'paste':
+            if self.paste_item is not None:
+                rect=self.paste_item.sceneBoundingRect()
+                pt=self.mapToScene(event.position().toPoint())
+                tolerance=12.0/max(.1,self.transform().m11())
+                if abs(pt.x()-rect.right())<=tolerance and abs(pt.y()-rect.bottom())<=tolerance:
+                    self.drag_mode='resize_paste'
+                    self.paste_resize_start=pt
+                    self.paste_resize_scale=self.paste_item.scale()
+                    event.accept()
+                    return
+            super().mousePressEvent(event)
+            return
         point = self._point(event)
         if self.tool == 'new' and self.cleanup_boxes:
             candidates=[]
@@ -416,7 +457,7 @@ class ImageCanvas(QGraphicsView):
                QPen(QColor('#51c8ff'), 2, Qt.PenStyle.DashLine))
             self.temp_item.setZValue(90)
             event.accept(); return
-        if self.tool in ('brush','restore','smudge','picker'):
+        if self.tool in (*PAINT_TOOLS,'picker'):
             if self.tool == 'picker':
                 self.color_picked.emit((round(point.x()),round(point.y())))
             else:
@@ -440,12 +481,39 @@ class ImageCanvas(QGraphicsView):
                     return
         super().mouseDoubleClickEvent(event)
 
+    def keyPressEvent(self,event):
+        if self.paste_item is not None and event.key() in (
+                Qt.Key.Key_Return,Qt.Key.Key_Enter):
+            self.paste_confirmed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def contextMenuEvent(self,event):
         self.context_menu_requested.emit(event.globalPos())
         event.accept()
 
     def mouseMoveEvent(self,event):
         point = self._point(event)
+        if self.tool=='picker' and self.current_image is not None:
+            x=max(0,min(self.current_image.width-1,int(point.x())))
+            y=max(0,min(self.current_image.height-1,int(point.y())))
+            c=QColor(*self.current_image.convert('RGB').getpixel((x,y)))
+            self.picker_preview_item.setPixmap(picker_cursor_pixmap(c))
+            self.picker_preview_item.setOffset(-49,-104)
+            self.picker_preview_item.setPos(point)
+            self.picker_preview_item.show()
+        if self.drag_mode == 'resize_paste' and self.paste_item is not None:
+            base=self.paste_source
+            if base is not None:
+                p=self.mapToScene(event.position().toPoint())
+                x0,y0=self.paste_item.pos().x(),self.paste_item.pos().y()
+                scale=max(0.05,min(12.0,
+                    max((p.x()-x0)/max(1,base.width),
+                        (p.y()-y0)/max(1,base.height))))
+                self.paste_item.setScale(scale)
+            event.accept()
+            return
         if self.drag_mode == 'select' and self.drag_start is not None:
             self.temp_item.setRect(QRectF(self.drag_start, point).normalized())
             event.accept(); return
@@ -463,6 +531,10 @@ class ImageCanvas(QGraphicsView):
 
     def mouseReleaseEvent(self,event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self.drag_mode == 'resize_paste':
+                self.drag_mode=None
+                event.accept()
+                return
             if self.drag_mode == 'select':
                 point = self._point(event)
                 rect = QRectF(self.drag_start,point).normalized()
@@ -537,177 +609,344 @@ class EditorWindow(QMainWindow):
         self._sync()
         self.statusBar().showMessage('Выделите прямоугольник: фрагмент немедленно копируется как изображение.',9500)
 
+    def _saved_bool(self,key,default=False):
+        return str(self.settings.value(key,default)).lower() in ('true','1','yes')
+
+    def show_advanced_cleanup(self):
+        self.advanced_cleanup.exec()
+
+    def _update_color_previews(self):
+        if not hasattr(self,'color_button'):
+            return
+        text_color=self.text_color.name()
+        self.color_button.setStyleSheet(
+            'background:'+text_color+';border:3px solid #cbd2de;')
+        brush=self.brush_color.name()
+        darker=self.brush_color.darker(185).name()
+        self.brush_color_preview.setStyleSheet(
+            'background:qlineargradient(x1:0,y1:0,x2:0,y2:1,'
+            'stop:0 '+brush+',stop:1 '+darker+');'
+            'border:1px solid #a9b2c5;')
+
+    def _opacity_changed(self,value):
+        self.settings.setValue('brushOpacity',int(value))
+
     def _ui(self):
-        main=QWidget();self.setCentralWidget(main)
-        layout=QHBoxLayout(main);layout.setContentsMargins(0,0,0,0);layout.setSpacing(0)
+        main=QWidget()
+        self.setCentralWidget(main)
+        layout=QHBoxLayout(main)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(0)
         self.canvas=ImageCanvas(self)
         layout.addWidget(self.canvas,1)
-        side=QFrame();side.setMinimumWidth(270);side.setMaximumWidth(330)
-        sl=QVBoxLayout(side);sl.setContentsMargins(12,10,12,12);sl.setSpacing(8)
-        self.hint=QLabel('Выделение — копия в буфер. Очистка — только буквы. Текст — отдельной рамкой.')
-        self.hint.setWordWrap(True)
-        sl.addWidget(self.hint)
-        self.sidebar_modes=QStackedWidget()
+
+        side=QFrame(self)
+        side.setObjectName('editorSide')
+        side.setMinimumWidth(265)
+        side.setMaximumWidth(310)
+        side.setStyleSheet("""
+        QFrame#editorSide {background:#f1f3f6; color:#17274f;}
+        QFrame#editorSide QLabel {background:transparent;color:#182e61;}
+        QFrame#editorSide QPushButton, QFrame#editorSide QToolButton {
+            background:#f9fafc;color:#23315b;border:1px solid #cbd2de;
+            border-radius:2px;padding:6px;font-size:12px;}
+        QFrame#editorSide QPushButton:hover, QFrame#editorSide QToolButton:hover {
+            background:#e6ebfa;}
+        QFrame#editorSide QPushButton:disabled {color:#9aa4b6;background:#edf0f4;}
+        QFrame#editorSide QToolButton:checked {background:#4359d5;color:#ffffff;border:1px solid #3148ce;}
+        QFrame#editorSide QComboBox, QFrame#editorSide QFontComboBox,
+        QFrame#editorSide QSpinBox, QFrame#editorSide QPlainTextEdit {
+            background:#fbfcfd;color:#1c2b51;border:1px solid #cbd2de;border-radius:2px;padding:5px;}
+        QFrame#editorSide QSlider::groove:horizontal {
+            background:#c4c8d0;height:2px;}
+        QFrame#editorSide QSlider::handle:horizontal {
+            background:#0877cc;width:9px;height:21px;margin:-10px 0;border-radius:3px;}
+        """)
+        sl=QVBoxLayout(side)
+        sl.setContentsMargins(11,12,11,11)
+        sl.setSpacing(6)
+        self.sidebar_modes=QStackedWidget(side)
         sl.addWidget(self.sidebar_modes,1)
-        self.selection_panel=QWidget()
-        sel=QVBoxLayout(self.selection_panel)
-        sel.setContentsMargins(0,4,0,0)
-        sel.addWidget(QLabel('1. Выделите фрагмент изображения'))
-        sel.addWidget(QLabel('2. Вставьте его в переводчик'))
-        sel.addWidget(QLabel('3. Очистите буквы или исправьте кистью'))
-        help_label=QLabel('Розовые пиксели — маска очистки. Зелёные рамки включены; серые исключены. Щелчок переключает.')
-        help_label.setWordWrap(True)
-        sel.addWidget(help_label)
-        sel.addWidget(QLabel('Тип текста'))
-        self.cleanup_mode=QComboBox()
-        self.cleanup_mode.addItem('Обычный: тёмный', 'dark')
-        self.cleanup_mode.addItem('Обычный: светлый', 'light')
-        self.cleanup_mode.addItem('Контурный (светлая обводка)', 'outline')
-        self.cleanup_mode.setCurrentIndex(2)
-        self.cleanup_mode.currentIndexChanged.connect(self._cleanup_parameters_changed)
-        sel.addWidget(self.cleanup_mode)
-        sel.addWidget(QLabel('Восстановление фона'))
-        self.cleanup_method=QComboBox()
-        self.cleanup_method.addItem('Telea — текстура и градиенты', 'telea')
-        self.cleanup_method.addItem('Линейный градиент', 'plane')
-        self.cleanup_method.addItem('Квадратичный градиент', 'quadratic')
-        self.cleanup_method.currentIndexChanged.connect(self._cleanup_repair_changed)
-        sel.addWidget(self.cleanup_method)
-        grow_row=QHBoxLayout()
-        grow_row.addWidget(QLabel('Край штриха'))
-        self.cleanup_grow=QSpinBox()
-        self.cleanup_grow.setRange(0,3)
-        self.cleanup_grow.setValue(2)
-        self.cleanup_grow.valueChanged.connect(self._cleanup_parameters_changed)
-        grow_row.addWidget(self.cleanup_grow)
-        sel.addLayout(grow_row)
-        self.cleanup_stats=QLabel('Выделите надпись.')
-        sel.addWidget(self.cleanup_stats)
-        self.detect_button=QPushButton('Найти буквы')
-        self.detect_button.clicked.connect(self.detect_cleanup)
-        sel.addWidget(self.detect_button)
-        self.manual_box_button=QPushButton('Добавить рамку вручную')
-        self.manual_box_button.clicked.connect(lambda:self.set_tool('cleanup_add'))
-        sel.addWidget(self.manual_box_button)
-        self.preview_button=QPushButton('Предпросмотр результата')
-        self.preview_button.clicked.connect(self.preview_cleanup)
-        self.preview_button.setEnabled(False)
-        sel.addWidget(self.preview_button)
-        self.clear_button=QPushButton('Очистить отмеченные рамки')
-        self.clear_button.clicked.connect(self.clear_selection)
-        self.clear_button.setEnabled(False)
-        sel.addWidget(self.clear_button)
-        self.selection_text_button=QPushButton('Создать отдельную рамку текста')
-        self.selection_text_button.clicked.connect(self.insert_text)
-        sel.addWidget(self.selection_text_button)
-        sel.addStretch()
-        self.sidebar_modes.addWidget(self.selection_panel)
-
-        self.text_panel=QWidget()
-        tl=QVBoxLayout(self.text_panel)
-        tl.setContentsMargins(0,4,0,0)
-        tl.addWidget(QLabel('Текст выбранного блока'))
-        self.text_input=QPlainTextEdit()
-        self.text_input.setPlaceholderText('Перевод. Пробелы и переносы строк сохраняются.')
-        self.text_input.setMaximumHeight(220)
-        self.text_input.textChanged.connect(self._text_in_panel)
-        tl.addWidget(self.text_input)
-        self.insert_button=QPushButton('Новая рамка текста · протяните мышью')
-        self.insert_button.clicked.connect(self.insert_text)
-        tl.addWidget(self.insert_button)
-        tl.addWidget(QLabel('Шрифт выбранного блока'))
-        self.family=QFontComboBox()
-        self.family.setCurrentFont(QFont(str(self.settings.value('fontFamily','Arial'))))
-        self.family.currentFontChanged.connect(self._format_changed)
-        tl.addWidget(self.family)
-        fontrow=QHBoxLayout()
-        self.font_size=QSpinBox()
-        self.font_size.setRange(7,180)
-        self.font_size.setValue(int(self.settings.value('fontSize',28)))
-        self.font_size.valueChanged.connect(self._format_changed)
-        fontrow.addWidget(QLabel('Размер'))
-        fontrow.addWidget(self.font_size)
-        self.bold_button=QToolButton()
-        self.bold_button.setText('Ж')
-        self.bold_button.setCheckable(True)
-        self.bold_button.setChecked(str(self.settings.value('fontBold','false')).lower()=='true')
-        self.bold_button.toggled.connect(self._format_changed)
-        fontrow.addWidget(self.bold_button)
-        self.italic_button=QToolButton()
-        self.italic_button.setText('К')
-        self.italic_button.setCheckable(True)
-        self.italic_button.setChecked(str(self.settings.value('fontItalic','false')).lower()=='true')
-        self.italic_button.toggled.connect(self._format_changed)
-        fontrow.addWidget(self.italic_button)
-        tl.addLayout(fontrow)
-        self.color_button=QPushButton('Цвет текста…')
-        self.color_button.clicked.connect(self.choose_text_color)
-        tl.addWidget(self.color_button)
-        tl.addWidget(QLabel('Двойной щелчок по любому текстовому блоку возвращает его в режим правки.'))
-        tl.addStretch()
-        self.sidebar_modes.addWidget(self.text_panel)
-
-        self.brush_panel=QWidget()
-        bl=QVBoxLayout(self.brush_panel)
-        bl.setContentsMargins(0,4,0,0)
-        bl.addWidget(QLabel('Кисти — по образцу панели Paint 3D'))
-        self.brush_tool_buttons={}
-        tool_names=[
-            ('brush','🖌 Кисть'),('restore','▤ Восстановление'),
-            ('smudge','◉ Мастихин'),('picker','⊙ Пипетка')
-        ]
-        for mode,label in tool_names:
-            button=QPushButton(label)
-            button.setCheckable(True)
-            button.clicked.connect(lambda checked=False,t=mode:self.set_tool(t))
-            self.brush_tool_buttons[mode]=button
-            bl.addWidget(button)
-        bl.addWidget(QLabel('Толщина кисти'))
-        sizes=QHBoxLayout()
-        self.brush_slider=QSlider(Qt.Orientation.Horizontal)
-        self.brush_slider.setRange(1,160)
-        self.brush_slider.setValue(int(self.settings.value('brushSize',18)))
-        self.brush_diameter=QSpinBox()
-        self.brush_diameter.setRange(1,160)
-        self.brush_diameter.setValue(self.brush_slider.value())
-        self.brush_slider.valueChanged.connect(self.brush_diameter.setValue)
-        self.brush_diameter.valueChanged.connect(self.brush_slider.setValue)
-        self.brush_diameter.valueChanged.connect(self._brush_size_changed)
-        sizes.addWidget(self.brush_slider,1)
-        sizes.addWidget(self.brush_diameter)
-        bl.addLayout(sizes)
-        bl.addWidget(QLabel('Быстрые размеры'))
-        presets=QHBoxLayout()
-        for size in (4,12,24,48):
-            b=QToolButton()
-            b.setText(str(size))
-            b.clicked.connect(lambda checked=False,n=size:self.brush_diameter.setValue(n))
-            presets.addWidget(b)
-        bl.addLayout(presets)
-        bl.addWidget(QLabel('Цвета'))
-        swatches=QHBoxLayout()
-        for css in ('#1b1b1b','#ffffff','#8e8e8e','#e84445','#2a87d2','#42a978'):
-            b=QToolButton()
-            b.setFixedSize(32,28)
-            b.setToolTip(css)
-            b.setStyleSheet('background:'+css+';border:1px solid #6b7b8b;border-radius:5px;')
-            b.clicked.connect(lambda checked=False,color=css:self._set_brush_color(color))
-            swatches.addWidget(b)
-        bl.addLayout(swatches)
-        self.brush_color_button=QPushButton('Другой цвет…')
-        self.brush_color_button.clicked.connect(self.choose_brush_color)
-        bl.addWidget(self.brush_color_button)
-        bl.addWidget(QLabel('Изменения кистью видны сразу. Ctrl+Z отменяет последний штрих.'))
-        bl.addStretch()
-        self.sidebar_modes.addWidget(self.brush_panel)
-        sl.addStretch(1)
-        self.save_button=QPushButton('Сохранить результат в PNG…')
+        self.save_button=QPushButton('Сохранить PNG…')
         self.save_button.clicked.connect(self.save_png)
         sl.addWidget(self.save_button)
         layout.addWidget(side)
 
-        bar=QToolBar('Правка');bar.setMovable(False)
-        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        # CLEANUP — no debug information, instruction paragraphs or preview.
+        self.selection_panel=QWidget()
+        self.selection_panel.setObjectName('cleanupPane')
+        self.selection_panel.setStyleSheet('QWidget#cleanupPane {background:#f1f3f6;}')
+        sel=QVBoxLayout(self.selection_panel)
+        sel.setContentsMargins(2,2,2,4)
+        sel.setSpacing(9)
+        head=QLabel('Очистка текста')
+        head.setStyleSheet('color:#1367c1;font-size:16px;font-weight:500;')
+        sel.addWidget(head)
+        sel.addWidget(QLabel('Тип текста'))
+        self.cleanup_mode=QComboBox()
+        self.cleanup_mode.addItem('Тёмный', 'dark')
+        self.cleanup_mode.addItem('Светлый', 'light')
+        self.cleanup_mode.addItem('С обводкой', 'outline')
+        self.cleanup_mode.addItem('С тёмной обводкой', 'outline_dark')
+        idx=self.cleanup_mode.findData(str(self.settings.value('cleanupMode','outline')))
+        self.cleanup_mode.setCurrentIndex(max(0,idx))
+        self.cleanup_mode.currentIndexChanged.connect(self._cleanup_parameters_changed)
+        sel.addWidget(self.cleanup_mode)
+        self.clear_button=QPushButton('Очистить')
+        self.clear_button.setMinimumHeight(40)
+        self.clear_button.clicked.connect(self.clear_selection)
+        self.clear_button.setEnabled(False)
+        sel.addWidget(self.clear_button)
+        # The controls retained below are not displayed in the release UI.
+        self.cleanup_stats=QLabel('')
+        self.cleanup_stats.hide()
+        self.detect_button=QPushButton('Найти объекты')
+        self.detect_button.hide()
+        self.detect_button.clicked.connect(self.detect_cleanup)
+        self.preview_button=QPushButton('Предпросмотр')
+        self.preview_button.hide()
+        self.preview_button.clicked.connect(self.preview_cleanup)
+        self.manual_box_button=QPushButton('Рамка')
+        self.manual_box_button.hide()
+        self.manual_box_button.clicked.connect(lambda:self.set_tool('cleanup_add'))
+        sel.addStretch(1)
+        self.sidebar_modes.addWidget(self.selection_panel)
+
+        # Advanced settings are only in the toolbar menu. They are persistent.
+        self.advanced_cleanup=QDialog(self)
+        self.advanced_cleanup.setWindowTitle('Расширенные настройки очистки')
+        form=QFormLayout(self.advanced_cleanup)
+        self.cleanup_method=QComboBox(self.advanced_cleanup)
+        self.cleanup_method.addItem('Telea — текстура и градиенты','telea')
+        self.cleanup_method.addItem('Линейный градиент','plane')
+        self.cleanup_method.addItem('Квадратичный градиент','quadratic')
+        method_idx=self.cleanup_method.findData(str(self.settings.value('cleanupMethod','telea')))
+        self.cleanup_method.setCurrentIndex(max(0,method_idx))
+        self.cleanup_method.currentIndexChanged.connect(self._cleanup_repair_changed)
+        form.addRow('Восстановление фона',self.cleanup_method)
+        self.cleanup_grow=QSpinBox(self.advanced_cleanup)
+        self.cleanup_grow.setRange(0,3)
+        self.cleanup_grow.setValue(int(self.settings.value('cleanupGrow',2)))
+        self.cleanup_grow.valueChanged.connect(self._cleanup_parameters_changed)
+        form.addRow('Расширение маски, пикс.',self.cleanup_grow)
+        close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.advanced_cleanup.reject)
+        form.addRow(close)
+
+        # TEXT — similar in grouping, size and alignment controls to Paint 3D.
+        self.text_panel=QWidget()
+        self.text_panel.setObjectName('textPane')
+        self.text_panel.setStyleSheet('QWidget#textPane {background:#f1f3f6;}')
+        tl=QVBoxLayout(self.text_panel)
+        tl.setContentsMargins(2,2,2,4)
+        tl.setSpacing(8)
+        title=QLabel('Текст')
+        title.setStyleSheet('color:#1367c1;font-size:16px;font-weight:500;')
+        tl.addWidget(title)
+        self.family=QFontComboBox()
+        self.family.setCurrentFont(QFont(str(self.settings.value('fontFamily','Segoe UI'))))
+        self.family.currentFontChanged.connect(self._format_changed)
+        tl.addWidget(self.family)
+        row=QHBoxLayout()
+        self.font_size=QSpinBox()
+        self.font_size.setRange(7,180)
+        self.font_size.setValue(int(self.settings.value('fontSize',48)))
+        self.font_size.valueChanged.connect(self._format_changed)
+        row.addWidget(self.font_size,1)
+        self.text_color=QColor(str(self.settings.value('textColor','#101010')))
+        self.color_button=QToolButton()
+        self.color_button.setToolTip('Цвет текста')
+        self.color_button.setFixedSize(40,38)
+        self.color_button.clicked.connect(self.choose_text_color)
+        row.addWidget(self.color_button)
+        tl.addLayout(row)
+        style_row=QHBoxLayout()
+        self.bold_button=QToolButton()
+        self.bold_button.setText('Ж')
+        self.bold_button.setToolTip('Полужирный')
+        self.bold_button.setCheckable(True)
+        self.bold_button.setChecked(self._saved_bool('fontBold'))
+        self.bold_button.toggled.connect(self._format_changed)
+        style_row.addWidget(self.bold_button)
+        self.italic_button=QToolButton()
+        self.italic_button.setText('К')
+        self.italic_button.setToolTip('Курсив')
+        italic_font=QFont('Segoe UI',15)
+        italic_font.setItalic(True)
+        self.italic_button.setFont(italic_font)
+        self.italic_button.setCheckable(True)
+        self.italic_button.setChecked(self._saved_bool('fontItalic'))
+        self.italic_button.toggled.connect(self._format_changed)
+        style_row.addWidget(self.italic_button)
+        self.underline_button=QToolButton()
+        self.underline_button.setText('Ч̲')
+        self.underline_button.setToolTip('Подчёркнутый')
+        self.underline_button.setCheckable(True)
+        self.underline_button.setChecked(self._saved_bool('fontUnderline'))
+        self.underline_button.toggled.connect(self._format_changed)
+        style_row.addWidget(self.underline_button)
+        tl.addLayout(style_row)
+        self.align_buttons={}
+        self.align_group=QButtonGroup(self)
+        self.align_group.setExclusive(True)
+        align_row=QHBoxLayout()
+        for key,icon_text in (('left','≡'),('center','☷'),('right','≣')):
+            b=QToolButton()
+            b.setText(icon_text)
+            b.setCheckable(True)
+            b.setToolTip({'left':'По левому краю','center':'По центру',
+                          'right':'По правому краю'}[key])
+            b.setMinimumHeight(37)
+            b.clicked.connect(self._format_changed)
+            self.align_group.addButton(b)
+            self.align_buttons[key]=b
+            align_row.addWidget(b)
+        self.align_buttons.get(str(self.settings.value('fontAlign','left')),
+                               self.align_buttons['left']).setChecked(True)
+        tl.addLayout(align_row)
+        self.text_input=QPlainTextEdit()
+        self.text_input.setPlaceholderText('Введите или вставьте перевод')
+        self.text_input.textChanged.connect(self._text_in_panel)
+        self.text_input.setMaximumHeight(230)
+        tl.addWidget(self.text_input)
+        self.insert_button=QPushButton('Создать рамку текста')
+        self.insert_button.clicked.connect(self.insert_text)
+        tl.addWidget(self.insert_button)
+        tl.addStretch(1)
+        self.sidebar_modes.addWidget(self.text_panel)
+
+        # BRUSHES — Paint 3D-style, 5 tools per row, sliders and color grid.
+        self.brush_panel=QScrollArea()
+        self.brush_panel.setFrameShape(QFrame.Shape.NoFrame)
+        self.brush_panel.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.brush_panel.setWidgetResizable(True)
+        brush_inner=QWidget()
+        brush_inner.setObjectName('brushPane')
+        brush_inner.setStyleSheet('QWidget#brushPane {background:#f1f3f6;}')
+        self.brush_panel.setWidget(brush_inner)
+        bl=QVBoxLayout(brush_inner)
+        bl.setContentsMargins(2,2,2,4)
+        bl.setSpacing(8)
+        self.brush_title=QLabel('Маркер')
+        self.brush_title.setStyleSheet('color:#1367c1;font-size:16px;font-weight:500;')
+        bl.addWidget(self.brush_title)
+        tools_grid=QGridLayout()
+        tools_grid.setHorizontalSpacing(5)
+        tools_grid.setVerticalSpacing(4)
+        self.brush_tool_buttons={}
+        brush_names=(
+            ('marker','Маркер'),('calligraphy','Каллиграфическое перо'),
+            ('oil','Масляная кисть'),('watercolor','Акварель'),('pixel','Пиксельное перо'),
+            ('pencil','Карандаш'),('crayon','Мелок'),
+            ('restore','Ластик — восстановление оригинала'),
+            ('spray','Баллончик'),('fill','Заливка'))
+        for index,(name,label) in enumerate(brush_names):
+            b=QToolButton()
+            b.setIcon(brush_icon(name))
+            b.setIconSize(QSize(37,37))
+            b.setFixedSize(47,51)
+            b.setCheckable(True)
+            b.setToolTip(label)
+            b.clicked.connect(lambda checked=False,tool=name:self.set_tool(tool))
+            self.brush_tool_buttons[name]=b
+            tools_grid.addWidget(b,index//5,index%5)
+        bl.addLayout(tools_grid)
+        self.brush_labels=dict(brush_names)
+        self.brush_labels['smudge']='Мастихин'
+        self.brush_labels['picker']='Пипетка'
+        self.smudge_button=QToolButton()
+        self.smudge_button.setIcon(brush_icon('smudge'))
+        self.smudge_button.setIconSize(QSize(24,24))
+        self.smudge_button.setText('  Мастихин')
+        self.smudge_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.smudge_button.setCheckable(True)
+        self.smudge_button.clicked.connect(lambda:self.set_tool('smudge'))
+        self.brush_tool_buttons['smudge']=self.smudge_button
+        bl.addWidget(self.smudge_button)
+
+        thickness_head=QHBoxLayout()
+        thickness_head.addWidget(QLabel('Толщина'))
+        thickness_head.addStretch()
+        self.brush_diameter=QSpinBox()
+        self.brush_diameter.setSuffix(' пкс')
+        self.brush_diameter.setRange(1,160)
+        saved_tool=str(self.settings.value('lastBrush','marker'))
+        if saved_tool not in PAINT_TOOLS:saved_tool='marker'
+        self.last_brush=saved_tool
+        self.brush_diameter.setValue(int(self.settings.value('brushSize/'+saved_tool,5)))
+        self.brush_diameter.valueChanged.connect(self._brush_size_changed)
+        thickness_head.addWidget(self.brush_diameter)
+        bl.addLayout(thickness_head)
+        self.brush_slider=QSlider(Qt.Orientation.Horizontal)
+        self.brush_slider.setRange(1,160)
+        self.brush_slider.setValue(self.brush_diameter.value())
+        self.brush_slider.valueChanged.connect(self.brush_diameter.setValue)
+        self.brush_diameter.valueChanged.connect(self.brush_slider.setValue)
+        bl.addWidget(self.brush_slider)
+
+        opacity_head=QHBoxLayout()
+        opacity_head.addWidget(QLabel('Непрозрачность'))
+        opacity_head.addStretch()
+        self.brush_opacity=QSpinBox()
+        self.brush_opacity.setRange(0,100)
+        self.brush_opacity.setSuffix('%')
+        self.brush_opacity.setValue(int(self.settings.value('brushOpacity',100)))
+        self.brush_opacity.valueChanged.connect(self._opacity_changed)
+        opacity_head.addWidget(self.brush_opacity)
+        bl.addLayout(opacity_head)
+        self.opacity_slider=QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0,100)
+        self.opacity_slider.setValue(self.brush_opacity.value())
+        self.opacity_slider.valueChanged.connect(self.brush_opacity.setValue)
+        self.brush_opacity.valueChanged.connect(self.opacity_slider.setValue)
+        bl.addWidget(self.opacity_slider)
+        bl.addStretch(1)
+
+        self.other_color=QPushButton('Другое  ▾')
+        self.other_color.clicked.connect(self.choose_brush_color)
+        bl.addWidget(self.other_color)
+        color_row=QHBoxLayout()
+        self.brush_color=QColor(str(self.settings.value('brushColor','#2538ba')))
+        self.brush_color_preview=QPushButton()
+        self.brush_color_preview.setFixedHeight(47)
+        self.brush_color_preview.clicked.connect(self.choose_brush_color)
+        color_row.addWidget(self.brush_color_preview,1)
+        self.picker_button=QToolButton()
+        self.picker_button.setIcon(brush_icon('picker'))
+        self.picker_button.setIconSize(QSize(30,30))
+        self.picker_button.setFixedSize(47,47)
+        self.picker_button.setToolTip('Пипетка: наведите на пиксель и нажмите')
+        self.picker_button.clicked.connect(lambda:self.set_tool('picker'))
+        self.brush_tool_buttons['picker']=self.picker_button
+        color_row.addWidget(self.picker_button)
+        bl.addLayout(color_row)
+        colors=(
+            '#ffffff','#d0d0d0','#9d9d9d','#555555','#171717','#910018',
+            '#f1161d','#ff7b20','#ffbd00','#ffe9a0','#fff500','#b6ff00',
+            '#04c759','#80f5e8','#00c8f9','#473dc2','#ba39ad','#ffb5d4',
+            '#af7c55','#30304d','#0b76bb','#006d92','#8250a6','#bc88b2')
+        swatch_grid=QGridLayout()
+        swatch_grid.setSpacing(0)
+        for i,color in enumerate(colors):
+            b=QToolButton()
+            b.setFixedSize(39,34)
+            b.setStyleSheet('background:'+color+';border:0;border-radius:0;')
+            b.setToolTip(color)
+            b.clicked.connect(lambda checked=False,c=color:self._set_brush_color(c))
+            swatch_grid.addWidget(b,i//6,i%6)
+        bl.addLayout(swatch_grid)
+        self.add_color_button=QPushButton('＋  Другой цвет')
+        self.add_color_button.clicked.connect(self.choose_brush_color)
+        bl.addWidget(self.add_color_button)
+        self.sidebar_modes.addWidget(self.brush_panel)
+        self._update_color_previews()
+
+        # Single window, one row of labelled main operations.
+        bar=QToolBar('Редактор')
+        bar.setMovable(False)
+        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        bar.setIconSize(QSize(23,23))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea,bar)
         self.return_to_viewer=None
         self.back_action=QAction('← Просмотр',self)
@@ -715,37 +954,71 @@ class EditorWindow(QMainWindow):
         bar.addAction(self.back_action)
         bar.addSeparator()
         self.actions={}
-        for tool,label,shortcut in (
-            ('new','▭ Выделить','Alt+S'),
-            ('text','Текст','Alt+T'),('brush','Кисть','Alt+B'),('restore','Восстановить','Alt+E'),
-            ('smudge','Мастихин','Alt+M'),('picker','Пипетка','Alt+I'),('pan','Рука',None),
-            ('paste','Вставить фрагмент',None)):
-            action=QAction(label,self);self.actions[tool]=action
-            if shortcut:action.setShortcut(QKeySequence(shortcut))
-            if tool!='paste':
-                action.setCheckable(True)
-            if tool=='paste':action.triggered.connect(lambda:self.paste_fragment(force_image=True))
-            elif tool=='text':action.triggered.connect(self.insert_text)
-            else:action.triggered.connect(lambda _,name=tool:self.set_tool(name))
-            bar.addAction(action)
+        for key,label,shortcut in (
+            ('new','Выделить','Alt+S'),
+            ('text','Текст','Alt+T'),
+            ('brushes','Кисти','Alt+B'),
+            ('pan','Рука',None)):
+            a=QAction(label,self)
+            a.setCheckable(True)
+            if shortcut:a.setShortcut(QKeySequence(shortcut))
+            if key=='text':
+                a.triggered.connect(self.insert_text)
+            elif key=='brushes':
+                a.triggered.connect(lambda:self.set_tool(self.last_brush))
+            else:
+                a.triggered.connect(lambda checked=False,t=key:self.set_tool(t))
+            bar.addAction(a)
+            self.actions[key]=a
         bar.addSeparator()
-        for label,callback,shortcut in (
-            ('↶',self.undo,'Ctrl+Z'),('↷',self.redo,'Ctrl+Y'),
-            ('−',lambda:self.canvas.scale(.8,.8),None),
-            ('+',lambda:self.canvas.scale(1.25,1.25),None),
-            ('Вписать',self.canvas.fit_picture,'Alt+F'),('100%',self.canvas.actual_size,'Alt+1'),
-            ('PNG',self.save_png,'Ctrl+S')):
-            action=QAction(label,self)
-            if shortcut:action.setShortcut(QKeySequence(shortcut))
-            action.triggered.connect(callback)
-            bar.addAction(action)
+        clear_action=QAction('Очистить',self)
+        clear_action.setShortcut(QKeySequence('Alt+C'))
+        clear_action.triggered.connect(self.clear_selection)
+        bar.addAction(clear_action)
+        self.copy_action=QAction('Копировать',self)
+        self.copy_action.setShortcut(QKeySequence('Ctrl+C'))
+        self.copy_action.triggered.connect(self.copy_fragment)
+        bar.addAction(self.copy_action)
+        self.paste_action=QAction('Вставить',self)
+        self.paste_action.triggered.connect(lambda:self.paste_fragment(force_image=True))
+        bar.addAction(self.paste_action)
+        bar.addSeparator()
+        self.undo_action=QAction('↶ Отменить',self)
+        self.undo_action.setShortcut(QKeySequence('Ctrl+Z'))
+        self.undo_action.triggered.connect(self.undo)
+        bar.addAction(self.undo_action)
+        self.redo_action=QAction('↷ Повторить',self)
+        self.redo_action.setShortcut(QKeySequence('Ctrl+Y'))
+        self.redo_action.triggered.connect(self.redo)
+        bar.addAction(self.redo_action)
+        bar.addSeparator()
+        more=QToolButton()
+        more.setText('⋯')
+        more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        menu=QMenu(more)
+        menu.addAction('Расширенные настройки очистки…',self.show_advanced_cleanup)
+        menu.addSeparator()
+        menu.addAction('Рамка очистки вручную',lambda:self.set_tool('cleanup_add'))
+        menu.addAction('Обновить найденные области',self.detect_cleanup)
+        menu.addSeparator()
+        menu.addAction('Обрезать фрагмент',self.cut_fragment)
+        menu.addAction('Восстановить из оригинала',
+                       lambda:self.set_tool('restore'))
+        menu.addAction('Вписать',self.canvas.fit_picture)
+        menu.addAction('100%',self.canvas.actual_size)
+        more.setMenu(menu)
+        bar.addWidget(more)
+
         for shortcut,callback in (
-            ('Ctrl+C',self.copy_fragment),('Ctrl+V',self.paste_fragment),
+            ('Ctrl+V',self.paste_fragment),
             ('Ctrl+X',self.cut_fragment),('Delete',self.delete_active),
             ('Ctrl+Shift+Z',self.redo),('Escape',self.escape_tool),
             ('Ctrl+Return',self.commit_paste)):
-            a=QAction(self);a.setShortcut(QKeySequence(shortcut))
-            a.triggered.connect(callback);self.addAction(a)
+            action=QAction(self)
+            action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(callback)
+            self.addAction(action)
         self.canvas.rectangle_selected.connect(self._selected)
         self.canvas.painted.connect(self._painted)
         self.canvas.color_picked.connect(self._pick)
@@ -756,6 +1029,7 @@ class EditorWindow(QMainWindow):
         self.canvas.context_menu_requested.connect(self._context_menu)
         self.canvas.cleanup_box_toggled.connect(self._toggle_cleanup_box)
         self.canvas.cleanup_box_drawn.connect(self._manual_cleanup_box)
+        self.canvas.paste_confirmed.connect(self.commit_paste)
         self.set_tool('new')
 
     def _mark(self):
@@ -769,9 +1043,11 @@ class EditorWindow(QMainWindow):
         self.future.clear();self._mark()
 
     def undo(self):
-        if self.text_input.hasFocus():
+        if self.text_input.hasFocus() and self.text_input.document().isUndoAvailable():
             self.text_input.undo();return
-        if self.canvas.text_edit_item is not None and self.canvas.text_edit_item.hasFocus():
+        if (self.canvas.text_edit_item is not None
+                and self.canvas.text_edit_item.hasFocus()
+                and self.canvas.text_edit_item.document().isUndoAvailable()):
             self.canvas.text_edit_item.document().undo();return
         if not self.history:return
         self.future.append((self.working.copy(),deepcopy(self.layers),self.selection,
@@ -784,9 +1060,11 @@ class EditorWindow(QMainWindow):
         self.canvas.cancel_paste();self._sync();self._refresh_cleanup_overlay()
 
     def redo(self):
-        if self.text_input.hasFocus():
+        if self.text_input.hasFocus() and self.text_input.document().isRedoAvailable():
             self.text_input.redo();return
-        if self.canvas.text_edit_item is not None and self.canvas.text_edit_item.hasFocus():
+        if (self.canvas.text_edit_item is not None
+                and self.canvas.text_edit_item.hasFocus()
+                and self.canvas.text_edit_item.document().isRedoAvailable()):
             self.canvas.text_edit_item.document().redo();return
         if not self.future:return
         self.history.append((self.working.copy(),deepcopy(self.layers),self.selection,
@@ -806,7 +1084,10 @@ class EditorWindow(QMainWindow):
         self.canvas.set_text_layers(self.layers,self.selected_text)
         self._in_sync=True
         if 0 <= self.selected_text < len(self.layers):
-            self.text_input.setPlainText(self.layers[self.selected_text].text)
+            layer=self.layers[self.selected_text]
+            self._load_layer_settings(layer)
+            if self.text_input.toPlainText()!=layer.text:
+                self.text_input.setPlainText(layer.text)
         self._in_sync=False
 
     def _selected(self,box):
@@ -814,98 +1095,161 @@ class EditorWindow(QMainWindow):
         self.commit_paste()
         self.selection=clip_box(box,self.working.size)
         self.canvas.set_selection(self.selection)
-        self.copy_fragment()
+        self.copy_fragment(force_image=True)
         self.detect_cleanup()
         self.statusBar().showMessage('Фрагмент скопирован. Проверьте зелёные рамки букв перед очисткой.',8500)
 
     def _set_brush_color(self,color):
         self.brush_color=QColor(color)
         self.settings.setValue('brushColor',self.brush_color.name())
+        self._update_color_previews()
 
     def _context_menu(self,global_pos):
+        # Clipboard image operations must not depend on whatever text field
+        # happened to own focus before right-clicking on the canvas.
         self.canvas.setFocus()
         menu=QMenu(self)
-        paste=menu.addAction('Вставить изображение из буфера  Ctrl+V')
+        copy=menu.addAction('Копировать фрагмент   Ctrl+C')
+        copy.setEnabled(self.selection is not None)
+        copy.triggered.connect(lambda:self.copy_fragment(force_image=True))
+        paste=menu.addAction('Вставить изображение   Ctrl+V')
         paste.setEnabled(QApplication.clipboard().mimeData().hasImage())
         paste.triggered.connect(lambda:self.paste_fragment(force_image=True))
-        copy=menu.addAction('Копировать фрагмент  Ctrl+C')
-        copy.setEnabled(self.selection is not None)
-        copy.triggered.connect(self.copy_fragment)
+        cut=menu.addAction('Вырезать фрагмент   Ctrl+X')
+        cut.setEnabled(self.selection is not None)
+        cut.triggered.connect(self.cut_fragment)
+        delete=menu.addAction('Удалить')
+        delete.setEnabled(self.selection is not None or self.canvas.paste_item is not None
+                          or self.selected_text>=0)
+        delete.triggered.connect(self.delete_active)
         menu.addSeparator()
-        menu.addAction('Выделить прямоугольник',lambda:self.set_tool('new'))
-        menu.addAction('Новая рамка текста',self.insert_text)
-        menu.addAction('Найти буквы',self.detect_cleanup)
-        clear=menu.addAction('Очистить отмеченные рамки',self.clear_selection)
-        clear.setEnabled(self.clear_button.isEnabled())
+        menu.addAction('Выделить',lambda:self.set_tool('new'))
+        menu.addAction('Добавить рамку текста',self.insert_text)
+        menu.addAction('Добавить область очистки',lambda:self.set_tool('cleanup_add'))
+        clean=menu.addAction('Очистить',self.clear_selection)
+        clean.setEnabled(self.clear_button.isEnabled())
         menu.addSeparator()
-        menu.addAction('Кисть',lambda:self.set_tool('brush'))
-        menu.addAction('Мастихин',lambda:self.set_tool('smudge'))
-        menu.addAction('Восстановить оригинал',lambda:self.set_tool('restore'))
+        menu.addAction('Кисти',lambda:self.set_tool(self.last_brush))
+        menu.addAction('Расширенные настройки очистки…',
+                       self.show_advanced_cleanup)
         menu.exec(global_pos)
 
     def _focused_text(self):
         return self.text_input.hasFocus() or (self.canvas.text_edit_item is not None
            and self.canvas.text_edit_item.hasFocus())
 
-    def copy_fragment(self):
-        if self.text_input.hasFocus():
-            self.text_input.copy();return
-        if self.canvas.text_edit_item is not None and self.canvas.text_edit_item.hasFocus():
-            text=self.canvas.text_edit_item.textCursor().selectedText()
-            if text:QApplication.clipboard().setText(text)
+    def copy_fragment(self,force_image=False):
+        if not force_image and self.text_input.hasFocus():
+            self.text_input.copy()
             return
-        if self.selection is None:return
+        if (not force_image and self.canvas.text_edit_item is not None
+                and self.canvas.text_edit_item.hasFocus()):
+            selection=self.canvas.text_edit_item.textCursor().selectedText()
+            if selection:
+                QApplication.clipboard().setText(selection)
+                return
+        if self.selection is None:
+            self.statusBar().showMessage('Сначала выделите фрагмент.',4500)
+            return
         x,y,w,h=clip_box(self.selection,self.working.size)
         if w*h:
-            QApplication.clipboard().setImage(qimage_from_pil(self.working.crop((x,y,x+w,y+h))))
+            # Include already entered translated text in copied raster.
+            picture=(composite_text(self.working,self.layers)
+                     if self.layers else self.working)
+            crop=picture.crop((x,y,x+w,y+h))
+            QApplication.clipboard().setImage(qimage_from_pil(crop))
+            self.statusBar().showMessage('Фрагмент скопирован как изображение.',3500)
+
+    def _erase_image_selection(self):
+        if self.selection is None:
+            return
+        x,y,w,h=clip_box(self.selection,self.working.size)
+        if w*h==0:
+            return
+        src=np.asarray(self.working.convert('RGB'))
+        pad=min(22,max(4,min(w,h)//3))
+        x0=max(0,x-pad);y0=max(0,y-pad)
+        x1=min(src.shape[1],x+w+pad);y1=min(src.shape[0],y+h+pad)
+        context=src[y0:y1,x0:x1]
+        valid=np.ones(context.shape[:2],dtype=bool)
+        valid[y-y0:y-y0+h,x-x0:x-x0+w]=False
+        samples=context[valid]
+        color=tuple(np.median(samples,axis=0).astype(np.uint8)) if len(samples) else (255,255,255)
+        self._checkpoint()
+        new=self.working.copy()
+        new.paste(Image.new('RGB',(w,h),color),(x,y))
+        self.working=new
+        self._invalidate_cleanup_preview()
+        self._cleanup_candidates=[]
+        self._cleanup_enabled=[]
+        self._cleanup_base_mask=None
+        self._cleanup_labels=None
+        self._sync()
+        self._refresh_cleanup_overlay()
 
     def cut_fragment(self):
         if self._focused_text():
-            if self.text_input.hasFocus():self.text_input.cut()
+            if self.text_input.hasFocus():
+                self.text_input.cut()
+            elif self.canvas.text_edit_item is not None:
+                cur=self.canvas.text_edit_item.textCursor()
+                cur.removeSelectedText()
             return
-        if self.selection is None:return
-        self.copy_fragment()
-        x,y,w,h=clip_box(self.selection,self.working.size)
-        self._checkpoint()
-        # Cutting copies pixels then restores the original region rather than
-        # creating a destructive solid-color hole.
-        self.working.paste(self.original.crop((x,y,x+w,y+h)),(x,y))
-        self._sync()
+        if self.selection is None:
+            return
+        self.copy_fragment(force_image=True)
+        self._erase_image_selection()
 
     def paste_fragment(self,force_image=False):
-        if self.text_input.hasFocus() and not force_image:
-            self.text_input.paste();return
+        clipboard=QApplication.clipboard()
+        if not force_image and self.text_input.hasFocus():
+            self.text_input.paste()
+            return
         if (not force_image and self.canvas.text_edit_item is not None
                 and self.canvas.text_edit_item.hasFocus()):
-            cursor = self.canvas.text_edit_item.textCursor()
-            cursor.insertText(QApplication.clipboard().text())
+            cursor=self.canvas.text_edit_item.textCursor()
+            cursor.insertText(clipboard.text())
             self.canvas.text_edit_item.setTextCursor(cursor)
             return
-        image=QApplication.clipboard().image()
-        if image.isNull():
-            self.statusBar().showMessage('В буфере нет изображения.',4500);return
-        pil=qimage_to_pil(image)
-        if pil.width>max(5000,self.working.width*3) or pil.height>max(5000,self.working.height*3):
-            QMessageBox.warning(self,'Вставка','Слишком большой фрагмент.');return
+        q=clipboard.image()
+        if q.isNull():
+            self.statusBar().showMessage('В буфере обмена нет изображения.',5000)
+            return
+        pil=qimage_to_pil(q)
+        if (pil.width>max(5000,self.working.width*3)
+                or pil.height>max(5000,self.working.height*3)):
+            QMessageBox.warning(self,'Вставка','Фрагмент слишком большой.')
+            return
         if self.selection:
             x,y,_,_=self.selection
         else:
             x,y=round(self.working.width*.2),round(self.working.height*.2)
         self.canvas.add_paste(pil,(x,y))
-        self.statusBar().showMessage('Перетащите фрагмент мышью. Enter — применить, Esc — отменить.',6500)
+        self.set_tool('paste')
+        self.statusBar().showMessage(
+            'Перетащите фрагмент; нижний правый угол — размер. Enter — применить, Esc — отменить.',8500)
 
     def commit_paste(self):
         item=self.canvas.paste_item
-        if item is None:return
-        self._checkpoint()
-        pil=qimage_to_pil(item.pixmap().toImage())
+        if item is None:
+            return
+        source=self.canvas.paste_source.copy()
+        scale=item.scale()
+        if abs(scale-1)>1e-6:
+            source=source.resize((max(1,round(source.width*scale)),
+                                  max(1,round(source.height*scale))),
+                                 Image.Resampling.LANCZOS)
         x,y=round(item.pos().x()),round(item.pos().y())
+        self._checkpoint()
         base=self.working.convert('RGBA')
-        base.alpha_composite(pil,(x,y)) if x>=0 and y>=0 else base.paste(pil,(x,y),pil)
-        self.working=base.convert('RGB') if self.working.mode=='RGB' else base
+        pasted=Image.new('RGBA',base.size,(0,0,0,0))
+        pasted.paste(source.convert('RGBA'),(x,y))
+        self.working=Image.alpha_composite(base,pasted)
+        if self.original.mode=='RGB':
+            self.working=self.working.convert('RGB')
         self.canvas.cancel_paste()
-        self.canvas.set_tool('new')
         self._sync()
+        self.set_tool('new')
 
     def escape_tool(self):
         if self.canvas.paste_item:
@@ -938,10 +1282,13 @@ class EditorWindow(QMainWindow):
             self.canvas.set_cleanup_mask(self._approved_cleanup_mask(),self.selection)
 
     def _cleanup_parameters_changed(self,*_):
+        self.settings.setValue('cleanupMode',self.cleanup_mode.currentData())
+        self.settings.setValue('cleanupGrow',self.cleanup_grow.value())
         if self.selection is not None and self.selection not in self._cleanup_done_selections:
             self.detect_cleanup()
 
     def _cleanup_repair_changed(self,*_):
+        self.settings.setValue('cleanupMethod',self.cleanup_method.currentData())
         self._invalidate_cleanup_preview()
         self._refresh_cleanup_overlay()
 
@@ -1093,30 +1440,59 @@ class EditorWindow(QMainWindow):
             f'Очищено {np.count_nonzero(mask)} пикселей в {len(approved)} объектах. Ctrl+Z — отменить.',9000)
 
     def set_tool(self,tool):
+        if tool=='brushes':
+            tool=self.last_brush
         if self._cleanup_preview_active and tool not in ('new','cleanup_add'):
             self._stop_cleanup_preview()
-            self._refresh_cleanup_overlay()
-        if self.canvas.paste_item and tool!='paste':self.commit_paste()
+        if self.canvas.paste_item and tool!='paste':
+            self.commit_paste()
+        if tool in PAINT_TOOLS:
+            self.last_brush=tool
+            self.settings.setValue('lastBrush',tool)
+            self.brush_title.setText(self.brush_labels.get(tool,'Кисти'))
+            size=int(self.settings.value('brushSize/'+tool,5))
+            if size!=self.brush_diameter.value():
+                self.brush_diameter.blockSignals(True)
+                self.brush_diameter.setValue(size)
+                self.brush_diameter.blockSignals(False)
+                self.brush_slider.setValue(size)
+            self.canvas.brush_size=size
         self.canvas.set_tool(tool)
-        section=2 if tool in ('brush','restore','smudge','picker') else (1 if tool in ('text','text_new') else 0)
+        brushes=tool in (*PAINT_TOOLS,'picker')
+        section=2 if brushes else (1 if tool in ('text','text_new') else 0)
         self.sidebar_modes.setCurrentIndex(section)
-        active='text' if tool in ('text','text_new') else tool
+        mode='brushes' if brushes else ('text' if tool in ('text','text_new') else tool)
         for name,action in self.actions.items():
-            if action.isCheckable():action.setChecked(name==active)
+            if action.isCheckable():
+                action.setChecked(name==mode)
         for name,button in self.brush_tool_buttons.items():
-            button.setChecked(name==active)
-        names={'cleanup_add':'Нарисуйте рамку пропущенной буквы',
-               'new':'Выделение сразу копирует картинку',
-               'text_new':'Протяните отдельную рамку текста',
-               'brush':'Кисть','restore':'Восстановление из оригинала',
-               'smudge':'Мастихин','picker':'Пипетка',
-               'text':'Двойной щелчок по другой текстовой рамке вернёт к её правке',
-               'pan':'Перемещение изображения','paste':'Перемещение вставленного фрагмента'}
-        self.statusBar().showMessage(names.get(tool,tool),7000)
+            button.setChecked(name==tool)
+        if tool in ('new','cleanup_add'):
+            self._refresh_cleanup_overlay()
+        else:
+            self.canvas.set_cleanup_boxes([],[])
+            self.canvas.set_cleanup_mask(None,None)
+        if tool not in ('text',):
+            self.canvas.setFocus()
+        names={
+            'cleanup_add':'Нарисуйте рамку пропущенного участка',
+            'new':'Выделение копирует изображение; щелчок по рамке исключает объект',
+            'text_new':'Протяните рамку текста мышью',
+            'text':'Двойной щелчок возвращает к редактированию текстового блока',
+            'pan':'Перемещение изображения',
+            'paste':'Переместите или растяните вставленный фрагмент; Enter — применить',
+            'picker':'Пипетка: наведите на пиксель, щёлкните для выбора цвета'
+        }
+        self.statusBar().showMessage(names.get(tool,self.brush_labels.get(tool,'')),6000)
 
     def _current_settings(self):
-        return {'family':self.family.currentFont().family(),'size':self.font_size.value(),
-                'bold':self.bold_button.isChecked(),'italic':self.italic_button.isChecked(),
+        align=next((key for key,b in self.align_buttons.items() if b.isChecked()),'left')
+        return {'family':self.family.currentFont().family(),
+                'size':self.font_size.value(),
+                'bold':self.bold_button.isChecked(),
+                'italic':self.italic_button.isChecked(),
+                'underline':self.underline_button.isChecked(),
+                'alignment':align,
                 'color':self.text_color.name()}
 
     def insert_text(self):
@@ -1153,18 +1529,21 @@ class EditorWindow(QMainWindow):
 
     def _load_layer_settings(self,layer):
         self._in_sync=True
-        controls=(self.family,self.font_size,self.bold_button,self.italic_button)
-        for c in controls:c.blockSignals(True)
+        controls=(self.family,self.font_size,self.bold_button,
+                  self.italic_button,self.underline_button)
+        for control in controls:control.blockSignals(True)
         try:
             self.family.setCurrentFont(QFont(layer.family))
             self.font_size.setValue(layer.size)
             self.bold_button.setChecked(layer.bold)
             self.italic_button.setChecked(layer.italic)
+            self.underline_button.setChecked(layer.underline)
+            self.align_buttons.get(layer.alignment,self.align_buttons['left']).setChecked(True)
             self.text_color=QColor(layer.color)
+            self._update_color_previews()
         finally:
-            for c in controls:c.blockSignals(False)
+            for control in controls:control.blockSignals(False)
             self._in_sync=False
-        self.color_button.setStyleSheet('border: 2px solid '+layer.color)
 
     def _choose_text_layer(self,index):
         if not 0 <= index < len(self.layers):return
@@ -1192,9 +1571,12 @@ class EditorWindow(QMainWindow):
     def _format_changed(self,*_):
         if self._in_sync:return
         settings=self._current_settings()
-        for key,val in [('fontFamily',settings['family']),('fontSize',settings['size']),
+        for key,val in (('fontFamily',settings['family']),('fontSize',settings['size']),
                         ('fontBold',settings['bold']),('fontItalic',settings['italic']),
-                        ('textColor',settings['color'])]:self.settings.setValue(key,val)
+                        ('fontUnderline',settings['underline']),
+                        ('fontAlign',settings['alignment']),('textColor',settings['color'])):
+            self.settings.setValue(key,val)
+        self._update_color_previews()
         if 0<=self.selected_text<len(self.layers):
             layer=self.layers[self.selected_text]
             for key,val in settings.items():setattr(layer,key,val)
@@ -1202,16 +1584,20 @@ class EditorWindow(QMainWindow):
             self._mark()
 
     def choose_text_color(self):
-        c=QColorDialog.getColor(self.text_color,self,'Цвет вставляемого текста')
-        if c.isValid():self.text_color=c;self._format_changed()
+        chosen=QColorDialog.getColor(self.text_color,self,'Цвет текста')
+        if chosen.isValid():
+            self.text_color=chosen
+            self._format_changed()
 
     def choose_brush_color(self):
-        c=QColorDialog.getColor(self.brush_color,self,'Цвет кисти')
-        if c.isValid():self.brush_color=c;self.settings.setValue('brushColor',c.name())
+        chosen=QColorDialog.getColor(self.brush_color,self,'Цвет кисти')
+        if chosen.isValid():
+            self._set_brush_color(chosen.name())
 
     def _brush_size_changed(self,value):
         self.canvas.brush_size=value
-        self.settings.setValue('brushSize',value)
+        name=self.last_brush if self.last_brush in PAINT_TOOLS else 'marker'
+        self.settings.setValue('brushSize/'+name,int(value))
 
     def _painted(self,event):
         start,end,tool,size,first=event
@@ -1220,37 +1606,48 @@ class EditorWindow(QMainWindow):
             self._refresh_pixmap()
             return
         if first or not self._stroke_in_progress:
-            self._checkpoint();self._stroke_in_progress=True
-        a=(start.x(),start.y());b=(end.x(),end.y())
-        if tool=='smudge':
-            self.working=palette_smudge(self.working,a,b,size)
-        else:
-            self.working=brush_segment(self.working,self.original,a,b,size,
-                (*self.brush_color.getRgb()[:3],255),restore=(tool=='restore'))
-        if not self._render_timer.isActive():self._render_timer.start(35)
+            self._checkpoint()
+            self._stroke_in_progress=True
+        a=(start.x(),start.y())
+        b=(end.x(),end.y())
+        self.working=draw_stroke(
+            self.working,self.original,a,b,size,
+            self.brush_color.getRgb()[:3],tool,
+            self.brush_opacity.value())
+        if not self._render_timer.isActive():
+            self._render_timer.start(35)
 
     def _pick(self,coords):
         x,y=coords
-        x=max(0,min(self.working.width-1,x));y=max(0,min(self.working.height-1,y))
-        self.brush_color=QColor(*self.working.convert('RGB').getpixel((x,y)))
-        self.settings.setValue('brushColor',self.brush_color.name())
-        self.statusBar().showMessage('Цвет кисти: '+self.brush_color.name(),4500)
+        x=max(0,min(self.working.width-1,x))
+        y=max(0,min(self.working.height-1,y))
+        pixel=self.working.convert('RGB').getpixel((x,y))
+        self._set_brush_color(QColor(*pixel).name())
+        self.set_tool(self.last_brush)
+        self.statusBar().showMessage('Цвет: '+self.brush_color.name().upper(),6500)
 
     def delete_active(self):
         if self._focused_text():
             if self.text_input.hasFocus():
-                cursor=self.text_input.textCursor();cursor.deleteChar()
+                cursor=self.text_input.textCursor()
+                cursor.deleteChar()
             elif self.canvas.text_edit_item is not None:
-                cursor=self.canvas.text_edit_item.textCursor();cursor.deleteChar()
+                cursor=self.canvas.text_edit_item.textCursor()
+                cursor.deleteChar()
                 self.canvas.text_edit_item.setTextCursor(cursor)
             return
         if self.canvas.paste_item:
-            self.canvas.cancel_paste();return
-        if 0<=self.selected_text<len(self.layers):
-            self._checkpoint();self.layers.pop(self.selected_text)
-            self.selected_text=-1;self._sync()
-        else:
-            self.selection=None;self.canvas.set_selection(None)
+            self.canvas.cancel_paste()
+            self.set_tool('new')
+            return
+        if 0<=self.selected_text<len(self.layers) and self.canvas.tool=='text':
+            self._checkpoint()
+            self.layers.pop(self.selected_text)
+            self.selected_text=-1
+            self._sync()
+            return
+        if self.selection:
+            self._erase_image_selection()
 
     def save_png(self):
         self.commit_paste()

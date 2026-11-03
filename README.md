@@ -1,37 +1,34 @@
-# Manga Offline Translator — contrast cleanup preview 0.6.0
+# Manga Offline Translator 0.7.0 — offline viewer and Paint-style editor
 
-A personal, entirely offline image viewer and paint-style manga lettering editor for Windows 64-bit. Built with Python, Qt (PySide6), OpenCV, and Pillow. No subscription, account, cloud service or Google API is required.
+Windows x64 desktop app based on PySide6, Pillow and OpenCV. Fully offline; no cloud or OCR is called during manual editing. The bundled legacy OCR engine is not needed for manual cleanup.
 
 ## Workflow
 
-1. In the viewer, open an image, then choose **Перевести страницу** via the file menu (or `Ctrl+E`).
-2. In the editor, drag a rectangle over a Japanese inscription. **The crop is immediately copied to the Windows clipboard as an IMAGE**. Paste it into an image translator in your browser (external step; the editor itself stays offline).
-3. Select a cleaning mode in the right panel: **Обычный: тёмный**, **Обычный: светлый**, or **Контурный** (for black ink with a white halo). Set the edge expansion (0–3 pixels). The editor highlights the exact pixels it would remove in pink and shows component boxes. **Click a green box to exclude it** (it turns grey); use **Добавить рамку вручную** for missed areas (a manual box explicitly masks its full interior).
-   Choose a repair mode: **Telea** (recommended for manga gradients), **Линейный градиент** or **Квадратичный градиент**. Click **Предпросмотр очистки** to inspect the non-destructive result and then **Очистить отмеченные рамки** to commit exactly that preview. Only selected mask pixels are modified; everything outside is bit-for-bit preserved. Repeating the same cleanup is blocked; `Ctrl+Z` restores the previous image.
-4. Paste your translation in the right-hand text input, and choose **Текст**. Draw a new text rectangle independently of the cleanup selection. Edit the text right on the image, insert spaces and manual line breaks; the text clips at the box's edges. Resize its bottom-right corner. Double-click an existing text region to edit it and recover its own font settings.
-5. Choose font family, size, bold, italic, and text color. These defaults are stored in Qt `QSettings` and survive restarting the app.
-6. Touch up with **Кисть**, **Восстановить**, **Мастихин** (smudge), and **Пипетка**. Image fragments can be copied with `Ctrl+C` and pasted with `Ctrl+V`; move a floating pasted fragment without affecting the current zoom, apply with `Ctrl+Enter` or discard with `Esc`.
-7. Save using **PNG** / `Ctrl+S`. The original source file is never overwritten. Text, including out-of-bounds content, is clipped to its rectangle. PNG output is lossless.
+1. Open an image in the viewer and choose **Перевести страницу** (Ctrl+E). The editor opens **in the same window**.
+2. Drag a selection around the original lettering. Its original-size crop is **immediately copied as an image to the Windows clipboard** for manual translation in a browser.
+3. The editor highlights the detected **actual ink pixels** in pink and draws green candidate boxes. Click a box to exclude it (grey); click again to restore. Choose text type: dark, light, light-outlined or dark-outlined. Press **Очистить**. Ctrl+Z undoes the result. No preview step is required.
+4. Optional: **⋯ > Расширенные настройки очистки** contains Telea/linear/quadratic reconstruction and the 0–3 pixel mask-edge expansion. Settings persist between sessions. The accepted contrast-cleanup algorithm remains OCR-free and **never changes any pixel outside its approved mask**.
+5. Choose **Текст** on the top toolbar, then **draw an independent rectangle** for translated text. Type or paste the translation. The right-hand Text panel controls font, pixel size, color, bold, italic, underline and left/center/right alignment. Double-click an existing text box to return to it; every box keeps its own formatting until final raster export.
+6. Choose **Кисти** for the Paint 3D-inspired page: marker, calligraphy, oil paint, watercolor, pixel pen, pencil, crayon, restore eraser, spray, fill and palette knife. Thickness **per brush**, opacity, selected tool and color persist. The pipette shows pixel color in a magnified cursor bubble and picks it on click.
+7. A selection can be copied (Ctrl+C), cut (Ctrl+X) or pasted (Ctrl+V) as an **image**. The toolbar and right-click context menu have explicit copy/paste commands. Pasted images float above the page until confirmation: drag to move, drag the lower-right corner to scale, Enter/Ctrl+Enter to commit, Esc to cancel. When a text field has keyboard focus, ordinary Ctrl+V pastes text instead.
+8. Save as lossless **PNG** (Ctrl+S). The source image is never overwritten.
 
 ## Shortcuts
 
-* `Ctrl+C`: copy selected image rectangle (or highlighted text when typing).
-* `Ctrl+V`: paste image as movable fragment (or paste text into the active text editor).
-* `Ctrl+X`: copy selection and restore original pixels in it.
-* `Ctrl+Z` / `Ctrl+Y`: undo / redo.
-* `Delete`: remove active text box or cancel an empty selection.
-* `Alt+S/B/E/M/I/T`: Select / Brush / Restore / Smudge / Pick color / Text.
-* `Alt+F` / `Alt+1`: Fit page / 100% actual size. Mouse wheel zooms at cursor.
+- Alt+S: select; Alt+T: new text box; Alt+B: brushes; Alt+C: clean approved ink
+- Ctrl+C / Ctrl+V / Ctrl+X: copy / paste / cut (text fields use ordinary text clipboard)
+- Ctrl+Z / Ctrl+Y: undo / redo; Delete: delete selection or selected text object
+- Enter / Ctrl+Enter: apply floating pasted image; Esc: cancel
+- Mouse wheel: zoom under cursor; original pixels remain unchanged
 
-## Key guarantees
+## Important details
 
-* The editor never calls OCR or an external program during its workflow, avoiding the flashing Tesseract console window.
-* Viewer and editor never save or rescale the original on zoom. Zoom is display-only; editor display uses source-pixel Lanczos downsampling, with Qt smooth interpolation during interaction.
-* All manual edits happen in a working copy, and the original is never overwritten by the export dialog.
-* Contrast cleanup uses a background-dominated selected region and a strict pixel mask; it does not recognize language or characters. As with any automatic segmentation, illustrations may be mistaken for letters. Inspect the highlighted pixels and preview before applying. The mask, not the surrounding rectangles, controls which pixels change.
+- Text outlines can be **light or dark**. The automatic contrast mask is a proposal, not semantic letter recognition; high-contrast illustration may also be detected. Check the pink mask and disable unwanted boxes before pressing Clean.
+- A manually drawn cleanup rectangle (⋯ > Рамка очистки вручную) explicitly authorizes its entire interior. Automatic boxes authorize only segmented ink pixels.
+- Fine details of Paint 3D brush rendering differ from Microsoft's proprietary application. This implementation provides independently functioning brush styles, brush controls and pixel-level eyedropper behavior.
+- All editing works at source image resolution. Zooming is a display operation, with no destructive rescaling of the background. Editable text is composited only when exporting.
+- Font, underline, alignment, brush size per tool, opacity, colors, selected brush and advanced cleanup settings persist via Qt QSettings.
 
-## Windows setup
+## Build and Windows validation
 
-The GitHub Actions `Windows installer` workflow builds a self-contained 64-bit installer with PyInstaller/Inno Setup, executes all algorithm tests, launches real GUI smoke tests, installs and runs the finished package and finally uninstalls it before publishing a preview GitHub release.
-
-The bundled Tesseract from earlier versions is kept for legacy API compatibility and packaging checks, but **the new manual editor does not use it**.
+Run python -m pytest -q tests for image-operation tests and python main.py --gui-self-test for interaction checks. GitHub Actions builds a Windows 64-bit PyInstaller/Inno Setup bundle, runs the full suite, launches the GUI and checks install/run/uninstall of the packaged application before publishing a preview release.

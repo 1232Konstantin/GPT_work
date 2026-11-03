@@ -140,6 +140,78 @@ def gui_self_test(app):
             editor.redo()
             if editor.working.tobytes()!=after.tobytes():
                 raise RuntimeError('Redo did not restore the approved cleanup')
+            # UI regressions: simplified cleanup and a distinct Paint-3D-like
+            # brushes page. Test actual controls, not only the backing methods.
+            from PySide6.QtCore import QPointF
+            editor.set_tool('new')
+            assert editor.sidebar_modes.currentWidget() is editor.selection_panel
+            assert editor.preview_button.isHidden()
+            assert editor.cleanup_stats.isHidden()
+            assert editor.clear_button.text() == 'Очистить'
+            assert editor.cleanup_mode.findData('outline_dark')>=0
+
+            editor.set_tool('marker')
+            assert editor.sidebar_modes.currentWidget() is editor.brush_panel
+            assert len(editor.brush_tool_buttons)>=12
+            assert editor.actions['brushes'].isChecked()
+            editor.brush_diameter.setValue(23)
+            editor.brush_opacity.setValue(55)
+            editor._set_brush_color('#ed355e')
+            assert editor.brush_color.name()=='#ed355e'
+            before_brush=editor.working.copy()
+            editor._painted((QPointF(30,22),QPointF(76,22),'marker',23,True))
+            editor._painted((None,None,'marker',23,False))
+            assert editor.working.getpixel((48,22))!=before_brush.getpixel((48,22))
+            assert editor.working.getpixel((5,5))==before_brush.getpixel((5,5))
+            editor.set_tool('pencil')
+            editor.brush_diameter.setValue(7)
+            editor.set_tool('marker')
+            assert editor.brush_diameter.value()==23, 'Brush thickness was not remembered per tool'
+            assert editor.brush_opacity.value()==55
+            editor.settings.sync()
+            assert int(editor.settings.value('brushSize/marker'))==23
+            assert int(editor.settings.value('brushOpacity'))==55
+            editor.set_tool('picker')
+            editor._pick((48,22))
+            assert editor.canvas.tool=='marker', 'Picker must return to the previous brush'
+            assert editor.brush_color.isValid()
+
+            # Every text layer owns underline, alignment and other formatting.
+            editor._choose_text_layer(0)
+            editor.underline_button.setChecked(True)
+            editor.align_buttons['center'].click()
+            assert editor.layers[0].underline
+            assert editor.layers[0].alignment=='center'
+            editor._choose_text_layer(1)
+            assert not editor.underline_button.isChecked()
+            assert editor.layers[1].alignment=='left'
+            editor._choose_text_layer(0)
+            assert editor.underline_button.isChecked()
+            assert editor.align_buttons['center'].isChecked()
+            editor.settings.sync()
+            assert str(editor.settings.value('fontAlign'))=='center'
+            assert str(editor.settings.value('fontUnderline')).lower()=='true'
+
+            # An image crop is copied as image even when the text field owns focus.
+            editor.text_input.setFocus()
+            editor._selected((27,22,55,41))
+            assert app.clipboard().mimeData().hasImage()
+            editor.set_tool('new')
+            editor.copy_action.trigger()
+            assert app.clipboard().mimeData().hasImage()
+            from qt_editor import qimage_from_pil
+            fragment=Image.new('RGBA',(15,12),'#e45d45')
+            app.clipboard().setImage(qimage_from_pil(fragment))
+            editor.paste_action.trigger()
+            assert editor.canvas.paste_item is not None
+            editor.canvas.paste_item.setPos(8,8)
+            editor.canvas.paste_item.setScale(2.0)
+            editor.commit_paste()
+            assert editor.working.getpixel((15,15))[:3]==(228,93,69), 'Resized pasted image was not committed'
+            editor.canvas.setFocus()
+            editor.undo()
+            assert editor.working.getpixel((15,15))[:3]!=(228,93,69)
+            print('GUI smoke test: Paint-style brushes, persistent tool settings, text formatting and image clipboard succeeded')
             editor.dirty = False
             print('GUI smoke test: contrast pixel mask, exclusion, mode selection, preview/application and undo/redo succeeded')
         finally:

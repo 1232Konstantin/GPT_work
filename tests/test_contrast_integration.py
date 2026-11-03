@@ -92,3 +92,23 @@ def test_real_japanese_page_if_available():
     assert np.count_nonzero(mask)>1000
     out=repair_background(image,mask,'telea')
     assert np.array_equal(np.asarray(image)[mask==0],np.asarray(out)[mask==0])
+
+def test_dark_outline_around_light_lettering():
+    """Reverse polarity: a dark outline and a light glyph interior."""
+    bg=Image.new('RGB',(235,145),(188,172,154))
+    image=bg.copy()
+    draw=ImageDraw.Draw(image)
+    for x in (72,106,140):
+        draw.rectangle((x-4,42,x+20,102),fill=(7,10,15))
+        draw.rectangle((x,46,x+16,98),fill=(246,246,244))
+    selection=(47,25,152,102)
+    seg=segment_ink(image,selection,'outline_dark',grow=1)
+    roi,boxes,ids,labels=mask_components(seg.mask,selection)
+    assert len(boxes)>=3
+    agreed=confirmed_mask(seg.mask,roi,labels,ids,boxes,[True]*len(boxes))
+    assert agreed[65,82]>0, 'Light interior of outlined glyph must also be removed'
+    result=repair_background(image,agreed,'telea')
+    before=np.asarray(image)
+    after=np.asarray(result)
+    assert np.array_equal(before[agreed==0],after[agreed==0])
+    assert result.getpixel((0,0))==bg.getpixel((0,0))

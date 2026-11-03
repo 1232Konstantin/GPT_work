@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-Mode = Literal['dark', 'light', 'outline']
+Mode = Literal['dark', 'light', 'outline', 'outline_dark']
 
 
 @dataclass
@@ -133,6 +133,29 @@ def segment_ink(image:Image.Image, region:tuple[int,int,int,int], mode:Mode='dar
             close_to_rim=cv2.dilate(filled,_kernel(7))>0
             core=cv2.bitwise_or(filled,
                 cv2.bitwise_and(dark,np.uint8(close_to_rim)*255))
+    elif mode=='outline_dark':
+        # Dark outline around bright lettering. In light panels the interior
+        # of a white glyph may be almost the background colour: fill enclosed
+        # dark contours instead of assuming the inner pixels have contrast.
+        if base > 130:
+            rim=cv2.morphologyEx(dark,cv2.MORPH_CLOSE,_kernel(5))
+            contours,_=cv2.findContours(rim,cv2.RETR_EXTERNAL,
+                                         cv2.CHAIN_APPROX_SIMPLE)
+            enclosed=np.zeros_like(rim)
+            for contour in contours:
+                cx,cy,cw,ch=cv2.boundingRect(contour)
+                if (cw>crop.shape[1]*.75 or ch>crop.shape[0]*.75):
+                    continue
+                cv2.drawContours(enclosed,[contour],-1,255,-1)
+            near=cv2.dilate(rim,_kernel(9))>0
+            core=cv2.bitwise_or(
+                enclosed,cv2.bitwise_and(light,np.uint8(near)*255))
+        else:
+            # Very dark outline on dark background: use light glyph body as
+            # the seed and keep only dark strokes attached to that glyph.
+            near=cv2.dilate(light,_kernel(11))>0
+            core=cv2.bitwise_or(light,
+                cv2.bitwise_and(dark,np.uint8(near)*255))
     else:raise ValueError(mode)
     core=_components(core>0,(x0,y0),min_area=2,max_fraction=.45)
     # Include antialiased stroke edges but never grow outside selection.

@@ -51,7 +51,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
 # Start both real Qt windows headlessly on the Windows build host.
 $env:QT_QPA_PLATFORM = 'offscreen'
 python main.py --gui-self-test
-if ($LASTEXITCODE -ne 0) { throw 'Qt GUI smoke test failed before packaging' }
+if ($LASTEXITCODE -ne 0) {
+    $diag = Join-Path $env:TEMP 'manga_gui_smoke_error.txt'
+    if (Test-Path $diag) { Write-Host (Get-Content $diag -Raw) }
+    throw 'Qt GUI smoke test failed before packaging'
+}
 python tools/create_icon.py
 if ($LASTEXITCODE -ne 0) { throw 'Icon creation failed' }
 python -m PyInstaller --noconfirm --clean --windowed --onedir `

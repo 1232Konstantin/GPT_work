@@ -6,13 +6,17 @@ Set-Location $root
 # GUI-subsystem programs are not reliably awaited by PowerShell's call operator (&).
 # Use Start-Process and a bounded wait so a crash dialog cannot stall CI forever.
 function Assert-GuiExecutable([string]$executable, [string]$argument) {
+    $diagnostic = Join-Path $env:TEMP 'manga_gui_smoke_error.txt'
+    Remove-Item $diagnostic -ErrorAction SilentlyContinue
     $process = Start-Process -FilePath $executable -ArgumentList @($argument) -PassThru
     try {
         if (-not $process.WaitForExit(60000)) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            if (Test-Path $diagnostic) { Write-Host (Get-Content $diagnostic -Raw) }
             throw "GUI smoke test timed out: $executable $argument"
         }
         if ($process.ExitCode -ne 0) {
+            if (Test-Path $diagnostic) { Write-Host (Get-Content $diagnostic -Raw) }
             throw "GUI smoke test returned $($process.ExitCode): $executable $argument"
         }
     }

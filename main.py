@@ -24,6 +24,10 @@ def gui_self_test(app):
         viewer.current=path
         viewer.open_editor()
         editor=viewer.editor_by_path[path]
+        # The GUI test is executed three times (Python, packaged and installed).
+        # Never assume user defaults: QSettings deliberately persists controls.
+        editor.underline_button.setChecked(False)
+        editor.align_buttons['left'].click()
         try:
             app.processEvents()
             assert viewer.isVisible() and editor.isVisible()
@@ -232,7 +236,16 @@ def main():
     app.setApplicationName('Manga Offline Translator')
     app.setOrganizationName('MangaOffline')
     app.setStyle('Fusion');app.setStyleSheet(STYLE)
-    if '--gui-self-test' in sys.argv:return gui_self_test(app)
+    if '--gui-self-test' in sys.argv:
+        try:
+            return gui_self_test(app)
+        except BaseException:
+            from pathlib import Path
+            import tempfile
+            import traceback
+            diagnostic=Path(tempfile.gettempdir())/'manga_gui_smoke_error.txt'
+            diagnostic.write_text(traceback.format_exc(),encoding='utf-8')
+            return 17
     window=ViewerWindow();window.show()
     return app.exec()
 

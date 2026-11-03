@@ -6,7 +6,7 @@ from collections import OrderedDict
 import threading
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import Qt, QSize, QThreadPool, QTimer
+from PySide6.QtCore import Qt, QSize, QPoint, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QColor, QBrush, QIcon, QPainter
 from PySide6.QtWidgets import (QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QListWidget,
@@ -242,6 +242,9 @@ class ViewerWindow(QMainWindow):
         self.scanning = False
         self.editor_windows = []
         self.thumbnail_cache: OrderedDict[Path, Image.Image] = OrderedDict()
+        self._thumbnail_pending=set()
+        self._thumbnail_failed=set()
+        self._thumbnail_active=0
         self._build_ui()
         # All modes live in a single top-level window; keep the viewer alive
         # while editing instead of creating a second editor window.
@@ -332,6 +335,8 @@ class ViewerWindow(QMainWindow):
         self.list.setIconSize(QSize(50, 50))
         self.list.setSpacing(3)
         self.list.currentRowChanged.connect(self._select_row)
+        self.list.verticalScrollBar().valueChanged.connect(
+            lambda _value:self._schedule_thumbnails())
         lv.addWidget(self.list, 1)
         self.dup_button = QPushButton('⌕  Найти точные дубликаты')
         self.dup_button.clicked.connect(self.find_duplicates)
@@ -433,6 +438,7 @@ class ViewerWindow(QMainWindow):
         self.library_panel.setVisible(not self.library_panel.isVisible())
         if self.library_panel.isVisible():
             self.list.setFocus()
+            self._schedule_thumbnails()
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Открыть папку изображений')
@@ -448,6 +454,7 @@ class ViewerWindow(QMainWindow):
     def set_folder(self, folder: Path, selected: Path | None = None):
         self.cancel_duplicates()
         self.folder_generation += 1
+        self._thumbnail_failed.clear()
         generation = self.folder_generation
         self.folder = folder
         self.path_label.setText(str(folder))
@@ -567,50 +574,88 @@ class ViewerWindow(QMainWindow):
                 button.setIcon(QIcon())
 
     def _schedule_thumbnails(self):
-        if self.current not in self.visible:
+        # Skip expensive full-size page decodes while the library is hidden.
+        if (not self.library_panel.isVisible()
+                or self.current not in self.visible
+                or self._thumbnail_active>=2):
             return
-        self.thumb_generation += 1
-        generation = self.thumb_generation
-        idx = self.visible.index(self.current)
-        nearby = [p for p in self.visible[max(0, idx-15):min(len(self.visible), idx+16)]
-                  if p not in self.thumbnail_cache]
-        if not nearby:
-            self._apply_thumbnails()
+        idx=self.visible.index(self.current)
+        top=self.list.indexAt(QPoint(5,5)).row()
+        bottom=self.list.indexAt(QPoint(5,max(5,self.list.viewport().height()-5))).row()
+        if top<0:top=max(0,idx-6)
+        if bottom<top:bottom=min(len(self.visible)-1,top+18)
+        wanted=list(range(max(0,top-5),min(len(self.visible),bottom+9)))
+        wanted.sort(key=lambda i:(0 if top<=i<=bottom else 1,
+                                  abs(i-idx)))
+        for offset in range(1,8):
+            for k in (idx-offset,idx+offset):
+                if 0<=k<len(self.visible) and k not in wanted:
+                    wanted.append(k)
+        batch=[]
+        for i in wanted:
+            p=self.visible[i]
+            if (p in self.thumbnail_cache or p in self._thumbnail_pending
+                    or p in self._thumbnail_failed):
+                continue
+            batch.append(p)
+            if len(batch)>=4:
+                break
+        if not batch:
             return
+        epoch=self.folder_generation
+        self._thumbnail_pending.update(batch)
+        self._thumbnail_active+=1
+
         def load(_):
-            output = {}
-            for path in nearby:
+            output={}
+            for path in batch:
                 try:
                     with Image.open(path) as src:
-                        src.seek(0)
-                        img = ImageOps.exif_transpose(src).convert('RGB')
-                        img.thumbnail((100, 85), Image.Resampling.LANCZOS)
-                        output[path] = img.copy()
-                except (OSError, ValueError):
-                    pass
+                        # JPEG draft/reduce and PIL thumbnail before RGB
+                        # conversion avoid decoding huge manga scans at once.
+                        src.draft('RGB',(120,100))
+                        src.thumbnail((100,85),Image.Resampling.LANCZOS)
+                        thumb=ImageOps.exif_transpose(src).convert('RGB')
+                        output[path]=thumb.copy()
+                except (OSError,ValueError):
+                    continue
             return output
-        def ready(images):
-            if generation != self.thumb_generation:
-                return
-            self.thumbnail_cache.update(images)
-            while len(self.thumbnail_cache) > 150:
-                self.thumbnail_cache.popitem(last=False)
-            self._apply_thumbnails()
-        self.run_task(load, ready, failed=lambda _: None)
 
-    def _apply_thumbnails(self):
-        for index, path in enumerate(self.visible):
-            if path in self.thumbnail_cache:
-                item = self.list.item(index)
-                if item:
-                    item.setIcon(QIcon(pixmap_from_pil(self.thumbnail_cache[path])))
-        if self.current in self.visible:
-            idx = self.visible.index(self.current)
-            for offset, button in zip(range(-3, 4), self.filmstrip):
-                k = idx+offset
-                if 0 <= k < len(self.visible) and self.visible[k] in self.thumbnail_cache:
-                    button.setIcon(QIcon(pixmap_from_pil(self.thumbnail_cache[self.visible[k]])))
-                    button.setIconSize(QSize(76, 55))
+        def finish(images):
+            self._thumbnail_pending.difference_update(batch)
+            self._thumbnail_active=max(0,self._thumbnail_active-1)
+            if epoch!=self.folder_generation:
+                return
+            self._thumbnail_failed.update(p for p in batch if p not in images)
+            for p,img in images.items():
+                self.thumbnail_cache[p]=img
+                self.thumbnail_cache.move_to_end(p)
+            while len(self.thumbnail_cache)>180:
+                self.thumbnail_cache.popitem(last=False)
+            self._apply_thumbnails(images.keys())
+            self._schedule_thumbnails()
+
+        def failure(_message):
+            self._thumbnail_pending.difference_update(batch)
+            self._thumbnail_active=max(0,self._thumbnail_active-1)
+            if epoch==self.folder_generation:
+                self._thumbnail_failed.update(batch)
+                self._schedule_thumbnails()
+        self.run_task(load,finish,failed=failure)
+        # Start a second small batch in parallel for responsive scrolling.
+        if self._thumbnail_active<2:
+            self._schedule_thumbnails()
+
+    def _apply_thumbnails(self,paths=None):
+        lookup={path:i for i,path in enumerate(self.visible)}
+        for path in (paths if paths is not None else self.thumbnail_cache.keys()):
+            image=self.thumbnail_cache.get(path)
+            k=lookup.get(path)
+            if image is None or k is None:
+                continue
+            item=self.list.item(k)
+            if item is not None:
+                item.setIcon(QIcon(pixmap_from_pil(image)))
 
     def move(self, offset):
         if self.current in self.visible:

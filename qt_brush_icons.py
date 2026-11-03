@@ -9,8 +9,8 @@ def brush_icon(kind: str) -> QIcon:
     pix.fill(Qt.GlobalColor.transparent)
     p=QPainter(pix)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    dark=QColor("#22345b")
-    accent=QColor("#4055c9")
+    dark=QColor("#d6e7fa")
+    accent=QColor("#477de0")
     p.setPen(QPen(dark,2.2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap))
     p.setBrush(accent)
     if kind in ("marker","pixel","crayon"):

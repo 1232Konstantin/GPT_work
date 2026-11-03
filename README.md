@@ -1,34 +1,29 @@
-# Manga Offline Translator 0.7.0 — offline viewer and Paint-style editor
+# Manga Offline Translator 0.8.0 — просмотр и редактирование манги
 
-Windows x64 desktop app based on PySide6, Pillow and OpenCV. Fully offline; no cloud or OCR is called during manual editing. The bundled legacy OCR engine is not needed for manual cleanup.
+Локальное приложение Windows (PySide6, Pillow, OpenCV). При редактировании нет сетевых запросов и вызовов OCR. Исходное изображение не перезаписывается, итог сохраняется в PNG.
 
-## Workflow
+## Основной сценарий
 
-1. Open an image in the viewer and choose **Перевести страницу** (Ctrl+E). The editor opens **in the same window**.
-2. Drag a selection around the original lettering. Its original-size crop is **immediately copied as an image to the Windows clipboard** for manual translation in a browser.
-3. The editor highlights the detected **actual ink pixels** in pink and draws green candidate boxes. Click a box to exclude it (grey); click again to restore. Choose text type: dark, light, light-outlined or dark-outlined. Press **Очистить**. Ctrl+Z undoes the result. No preview step is required.
-4. Optional: **⋯ > Расширенные настройки очистки** contains Telea/linear/quadratic reconstruction and the 0–3 pixel mask-edge expansion. Settings persist between sessions. The accepted contrast-cleanup algorithm remains OCR-free and **never changes any pixel outside its approved mask**.
-5. Choose **Текст** on the top toolbar, then **draw an independent rectangle** for translated text. Type or paste the translation. The right-hand Text panel controls font, pixel size, color, bold, italic, underline and left/center/right alignment. Double-click an existing text box to return to it; every box keeps its own formatting until final raster export.
-6. Choose **Кисти** for the Paint 3D-inspired page: marker, calligraphy, oil paint, watercolor, pixel pen, pencil, crayon, restore eraser, spray, fill and palette knife. Thickness **per brush**, opacity, selected tool and color persist. The pipette shows pixel color in a magnified cursor bubble and picks it on click.
-7. A selection can be copied (Ctrl+C), cut (Ctrl+X) or pasted (Ctrl+V) as an **image**. The toolbar and right-click context menu have explicit copy/paste commands. Pasted images float above the page until confirmation: drag to move, drag the lower-right corner to scale, Enter/Ctrl+Enter to commit, Esc to cancel. When a text field has keyboard focus, ordinary Ctrl+V pastes text instead.
-8. Save as lossless **PNG** (Ctrl+S). The source image is never overwritten.
+1. Откройте папку или изображение в просмотрщике. Режим «Перевести страницу» открывается **в том же окне**.
+2. **Выделить**: мышью обозначьте фрагмент; нажмите «Копировать» или Ctrl+C. Этот режим **не запускает очистку** и не меняет буфер сам по себе. «Вставить» создаёт плавающий фрагмент в центре видимой части страницы; правая кнопка мыши → «Вставить» размещает его у курсора. Перед подтверждением фрагмент можно перенести и изменить размер за правый нижний угол. Enter — применить; Esc — отменить.
+3. **Очистка**: выберите тип текста и выделите область надписи. Приложение подсветит удаляемые пиксели и нарисует прямоугольники найденных контрастных объектов. Щелчок по зелёной рамке исключает объект (серая рамка). Кнопка «Очистить» изменит **только подтверждённые пиксели**, а затем снимет выделение. Для следующей надписи выделите новую область. Ctrl+Z отменяет очистку. Расширенные настройки восстановления находятся в меню «⋯».
+4. **Текст**: протяните мышью независимую рамку, введите перевод и настройте шрифт, размер, цвет, жирный/курсивный/подчёркнутый стиль и выравнивание. Текстовый блок остаётся отдельным объектом до экспорта. Рамка **перемещается за верхнюю границу (или Alt+перетаскиванием внутри)** и изменяется за края и углы. Двойной щелчок возвращает к ранее созданному блоку и его настройкам.
+5. **Кисти**: отдельная тёмная панель с инструментами рисования, толщиной (запоминается для каждой кисти), непрозрачностью, палитрой и пипеткой. При наведении пипетка отображает цвет пикселя в кружке над прицелом.
+6. **Масштаб**: видимый список «Вписать», 25–400 %, произвольное значение и кнопка «100%». Масштабирование не меняет исходные пиксели.
+7. **Сохранить PNG**: сохранение результирующей страницы без потерь. Начальный файл остаётся неизменным.
 
-## Shortcuts
+## Важные сочетания
 
-- Alt+S: select; Alt+T: new text box; Alt+B: brushes; Alt+C: clean approved ink
-- Ctrl+C / Ctrl+V / Ctrl+X: copy / paste / cut (text fields use ordinary text clipboard)
-- Ctrl+Z / Ctrl+Y: undo / redo; Delete: delete selection or selected text object
-- Enter / Ctrl+Enter: apply floating pasted image; Esc: cancel
-- Mouse wheel: zoom under cursor; original pixels remain unchanged
+- Alt+S — выделение изображения; Alt+C — режим очистки; Alt+T — текст; Alt+B — кисти.
+- Ctrl+C / Ctrl+V / Ctrl+X — копировать / вставить / вырезать; в редакторе текста стандартные сочетания работают с текстом.
+- Ctrl+Z / Ctrl+Y — отмена / повтор операции редактора.
+- Esc — отменить выделение или плавающую вставку.
+- Enter — подтвердить плавающую вставку; Ctrl+S — сохранить PNG.
 
-## Important details
+## Примечания к очистке
 
-- Text outlines can be **light or dark**. The automatic contrast mask is a proposal, not semantic letter recognition; high-contrast illustration may also be detected. Check the pink mask and disable unwanted boxes before pressing Clean.
-- A manually drawn cleanup rectangle (⋯ > Рамка очистки вручную) explicitly authorizes its entire interior. Automatic boxes authorize only segmented ink pixels.
-- Fine details of Paint 3D brush rendering differ from Microsoft's proprietary application. This implementation provides independently functioning brush styles, brush controls and pixel-level eyedropper behavior.
-- All editing works at source image resolution. Zooming is a display operation, with no destructive rescaling of the background. Editable text is composited only when exporting.
-- Font, underline, alignment, brush size per tool, opacity, colors, selected brush and advanced cleanup settings persist via Qt QSettings.
+Применяется принятый ранее алгоритм контрастной попиксельной маски без OCR. Рамки — это способ подтверждения **объектов**, а не прямоугольники для грубого закрашивания. Текст может иметь светлую или тёмную обводку. Сложные текстуры могут потребовать исключения неверно найденного объекта или локальной ретуши; за пределами подтверждённой маски изменение пикселей запрещено.
 
-## Build and Windows validation
+## Тесты
 
-Run python -m pytest -q tests for image-operation tests and python main.py --gui-self-test for interaction checks. GitHub Actions builds a Windows 64-bit PyInstaller/Inno Setup bundle, runs the full suite, launches the GUI and checks install/run/uninstall of the packaged application before publishing a preview release.
+Алгоритмические тесты: `python -m pytest -q tests`. Проверка Qt-взаимодействия: `python main.py --gui-self-test`. Windows CI проверяет приложение из исходников, упакованный EXE, установку и удаление приложения. UI проверяется также реальным имитированием событий мыши для перемещения и изменения размеров текста.

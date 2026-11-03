@@ -19,6 +19,8 @@ def gui_self_test(app):
         draw.ellipse((75,30,360,300), fill='#fdfbf4',outline='#26292c',width=4)
         for gx in (188,216,244):
             draw.rectangle((gx,173,gx+11,201),fill='#161616')
+        for gx in (346,379):
+            draw.rectangle((gx,204,gx+11,234),fill='#111111')
         img.save(path)
         viewer=ViewerWindow();viewer.show()
         viewer.current=path
@@ -48,9 +50,13 @@ def gui_self_test(app):
                   'editor.isWindow=',editor.isWindow(),flush=True)
             if viewer.mode_stack.currentWidget() is not editor or editor.isWindow():
                 raise RuntimeError('Editor must open inside the same top-level window')
+            editor.set_tool('new')
             editor._selected((130, 80, 125, 80))
+            if editor._cleanup_candidates or editor.canvas.cleanup_boxes:
+                raise RuntimeError('Plain selection must not start cleanup detection')
+            editor.copy_action.trigger()
             if not app.clipboard().mimeData().hasImage():
-                raise RuntimeError('Selected fragment was not copied as an image')
+                raise RuntimeError('Copy action did not copy selected image')
             editor.text_input.setPlainText('Hello\\nworld!')
             editor.insert_text()
             if editor.canvas.tool != 'text_new':
@@ -64,6 +70,47 @@ def gui_self_test(app):
             editor._choose_text_layer(0)
             if editor.font_size.value() != 36 or editor.selected_text != 0:
                 raise RuntimeError('Text-layer selection must restore its own font settings')
+            # Actual mouse interaction: drag a text frame by the top border,
+            # resize at its bottom-right corner, undo and redo the geometry.
+            from PySide6.QtTest import QTest
+            from PySide6.QtCore import Qt, QPoint, QPointF
+            editor.set_tool('text')
+            app.processEvents()
+            initial=tuple(editor.layers[0].box)
+            x,y,w,h=initial
+            p=editor.canvas.mapFromScene(QPointF(x+w/2,y+1))
+            q=editor.canvas.mapFromScene(QPointF(x+w/2+20,y+14))
+            QTest.mousePress(editor.canvas.viewport(),Qt.MouseButton.LeftButton,
+                             Qt.KeyboardModifier.NoModifier,p)
+            QTest.mouseMove(editor.canvas.viewport(),q)
+            QTest.mouseRelease(editor.canvas.viewport(),Qt.MouseButton.LeftButton,
+                               Qt.KeyboardModifier.NoModifier,q)
+            moved=tuple(editor.layers[0].box)
+            if moved[:2]==initial[:2]:
+                raise RuntimeError('Dragging upper text border must move text frame')
+            editor.undo()
+            if tuple(editor.layers[0].box)!=initial:
+                raise RuntimeError('Undo must restore text position')
+            editor.redo()
+            if tuple(editor.layers[0].box)!=moved:
+                raise RuntimeError('Redo must restore moved text frame')
+            editor._choose_text_layer(0)
+            x,y,w,h=moved
+            p=editor.canvas.mapFromScene(QPointF(x+w,y+h))
+            q=editor.canvas.mapFromScene(QPointF(x+w+22,y+h+14))
+            QTest.mousePress(editor.canvas.viewport(),Qt.MouseButton.LeftButton,
+                             Qt.KeyboardModifier.NoModifier,p)
+            QTest.mouseMove(editor.canvas.viewport(),q)
+            QTest.mouseRelease(editor.canvas.viewport(),Qt.MouseButton.LeftButton,
+                               Qt.KeyboardModifier.NoModifier,q)
+            if editor.layers[0].box[2:] == moved[2:]:
+                raise RuntimeError('Dragging text corner must resize text frame')
+            editor.undo()
+            if tuple(editor.layers[0].box)!=moved:
+                raise RuntimeError('Resize text must be undoable')
+            editor.redo()
+            if tuple(editor.layers[0].box[2:])==moved[2:]:
+                raise RuntimeError('Resize text must be redoable')
             viewer._return_to_viewer()
             if viewer.mode_stack.currentIndex() != 0:
                 raise RuntimeError('Back must show the original viewer')
@@ -86,6 +133,7 @@ def gui_self_test(app):
             import numpy as np
             editor.cleanup_mode.setCurrentIndex(2) # outlined text
             editor.cleanup_grow.setValue(2)
+            editor.set_tool('cleanup')
             editor._selected((170,155,116,68))
             if not editor._cleanup_candidates:
                 raise RuntimeError('No contrast components suggested for synthetic characters')
@@ -144,11 +192,37 @@ def gui_self_test(app):
             editor.redo()
             if editor.working.tobytes()!=after.tobytes():
                 raise RuntimeError('Redo did not restore the approved cleanup')
+            if editor.selection is not None or editor.canvas.cleanup_boxes:
+                raise RuntimeError('Successful cleanup must remove all stale selections')
+            first_done=editor.working.crop((170,155,286,223)).tobytes()
+            editor.insert_text()
+            editor._create_text_box((170,150,116,70))
+            editor.set_tool('cleanup')
+            editor._selected((325,185,105,80))
+            if not editor._cleanup_candidates:
+                raise RuntimeError('Second cleanup region did not detect glyphs')
+            second_before=editor.working.copy()
+            editor.clear_button.click()
+            if editor.working.tobytes()==second_before.tobytes():
+                raise RuntimeError('Second cleanup did not modify new region')
+            if editor.working.crop((170,155,286,223)).tobytes()!=first_done:
+                raise RuntimeError('Second cleanup unexpectedly modified first cleaned region')
+            if editor.selection is not None:
+                raise RuntimeError('Second cleaned selection was not cleared')
             # UI regressions: simplified cleanup and a distinct Paint-3D-like
             # brushes page. Test actual controls, not only the backing methods.
             from PySide6.QtCore import QPointF
             editor.set_tool('new')
-            assert editor.sidebar_modes.currentWidget() is editor.selection_panel
+            assert editor.sidebar_modes.currentWidget() is editor.clipboard_panel
+            assert editor.selection_panel.styleSheet().find('#1b2430')>=0
+            assert editor.brush_panel.widget().styleSheet().find('#1b2430')>=0
+            assert not editor.undo_action.icon().isNull()
+            assert not editor.redo_action.icon().isNull()
+            editor._apply_zoom_text('100%')
+            assert abs(editor.canvas.transform().m11()-1)<0.01
+            editor._apply_zoom_text('75%')
+            assert abs(editor.canvas.transform().m11()-.75)<0.01
+            assert editor.zoom_combo.currentText()=='75%'
             assert editor.preview_button.isHidden()
             assert editor.cleanup_stats.isHidden()
             assert editor.clear_button.text() == 'Очистить'
@@ -179,6 +253,9 @@ def gui_self_test(app):
             editor._pick((48,22))
             assert editor.canvas.tool=='marker', 'Picker must return to the previous brush'
             assert editor.brush_color.isValid()
+            assert (editor.canvas.viewport().cursor().shape()
+                    ==__import__('PySide6.QtCore',fromlist=['Qt']).Qt.CursorShape.ArrowCursor), (
+                'Picker must restore the normal cursor after sampling')
 
             # Every text layer owns underline, alignment and other formatting.
             editor._choose_text_layer(0)
@@ -197,12 +274,20 @@ def gui_self_test(app):
             assert str(editor.settings.value('fontUnderline')).lower()=='true'
 
             # An image crop is copied as image even when the text field owns focus.
-            editor.text_input.setFocus()
-            editor._selected((27,22,55,41))
-            assert app.clipboard().mimeData().hasImage()
             editor.set_tool('new')
+            editor.text_input.setFocus()
+            from qt_editor import qimage_from_pil
+            stored=Image.new('RGBA',(9,9),'#123456')
+            app.clipboard().setImage(qimage_from_pil(stored))
+            editor._selected((27,22,55,41))
+            assert not editor._cleanup_candidates
+            assert app.clipboard().image().size().width()==9, 'Selection overwrote clipboard'
+            menu=editor._make_context_menu(QPoint(100,100))
+            item_labels=[a.text() for a in menu.actions() if not a.isSeparator()]
+            assert item_labels==['Копировать','Вырезать','Вставить','Снять выделение'], item_labels
             editor.copy_action.trigger()
             assert app.clipboard().mimeData().hasImage()
+            assert app.clipboard().image().size().width()==55
             from qt_editor import qimage_from_pil
             fragment=Image.new('RGBA',(15,12),'#e45d45')
             app.clipboard().setImage(qimage_from_pil(fragment))
@@ -213,6 +298,10 @@ def gui_self_test(app):
             editor.commit_paste()
             assert editor.working.getpixel((15,15))[:3]==(228,93,69), 'Resized pasted image was not committed'
             editor.canvas.setFocus()
+            editor.undo()
+            assert editor.working.getpixel((15,15))[:3]!=(228,93,69)
+            editor.redo()
+            assert editor.working.getpixel((15,15))[:3]==(228,93,69)
             editor.undo()
             assert editor.working.getpixel((15,15))[:3]!=(228,93,69)
             print('GUI smoke test: Paint-style brushes, persistent tool settings, text formatting and image clipboard succeeded')

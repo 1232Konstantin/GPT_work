@@ -469,15 +469,6 @@ class ImageCanvas(QGraphicsView):
                 event.accept()
                 return
         if self.tool in ('new','cleanup','text','text_new','cleanup_add'):
-            if self.tool == 'text':
-                for i in reversed(range(len(self._text_layers))):
-                    if i == self._selected_text:
-                        continue
-                    x0, y0, w0, h0 = self._text_layers[i].box
-                    if x0 <= point.x() <= x0+w0 and y0 <= point.y() <= y0+h0:
-                        self.text_layer_selected.emit(i)
-                        event.accept()
-                        return
             if self.tool == 'text' and self.text_frame is not None:
                 x,y,w,h=self._text_layers[self._selected_text].box
                 margin=min(11/max(.2,self.transform().m11()),max(3,min(w,h)/5))
@@ -505,6 +496,16 @@ class ImageCanvas(QGraphicsView):
                 if x<=px<=x+w and y<=py<=y+h:
                     super().mousePressEvent(event)
                     return
+            if self.tool=='text':
+                # Active resize handles win over underlying overlapping layers.
+                for i in reversed(range(len(self._text_layers))):
+                    if i==self._selected_text:
+                        continue
+                    x0,y0,w0,h0=self._text_layers[i].box
+                    if x0<=point.x()<=x0+w0 and y0<=point.y()<=y0+h0:
+                        self.text_layer_selected.emit(i)
+                        event.accept()
+                        return
             self.drag_mode = 'select'
             self.drag_start = point
             if self.temp_item is not None:

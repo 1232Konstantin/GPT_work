@@ -653,7 +653,7 @@ class EditorWindow(QMainWindow):
         self.layers: list[TextLayer] = []
         self.selected_text = -1
         self.selection = None
-        self.history: list[tuple[Image.Image, list[TextLayer], object]] = []
+        self.history = []  # domain-specific transactions
         self.future = []
         self.settings = QSettings('MangaOffline','MangaOfflineTranslator')
         self.brush_color = QColor(str(self.settings.value('brushColor','#232323')))
@@ -684,7 +684,7 @@ class EditorWindow(QMainWindow):
         self.setMinimumSize(900,570)
         self._ui()
         self.canvas.set_picture(self.working)
-        self.canvas.set_tool('new')
+        self.canvas.set_tool('cleanup')
         self._sync()
         self.statusBar().showMessage('Выделите прямоугольник: фрагмент немедленно копируется как изображение.',9500)
 
@@ -808,6 +808,7 @@ class EditorWindow(QMainWindow):
         self.cleanup_mode.addItem('Светлый', 'light')
         self.cleanup_mode.addItem('С обводкой', 'outline')
         self.cleanup_mode.addItem('С тёмной обводкой', 'outline_dark')
+        self.cleanup_mode.addItem('Ровный фон', 'flat')
         idx=self.cleanup_mode.findData(str(self.settings.value('cleanupMode','outline')))
         self.cleanup_mode.setCurrentIndex(max(0,idx))
         self.cleanup_mode.currentIndexChanged.connect(self._cleanup_parameters_changed)
@@ -817,6 +818,9 @@ class EditorWindow(QMainWindow):
         self.clear_button.clicked.connect(self.clear_selection)
         self.clear_button.setEnabled(False)
         sel.addWidget(self.clear_button)
+        self.cleanup_paste_button=QPushButton('Вставить из буфера')
+        self.cleanup_paste_button.clicked.connect(lambda:self.paste_fragment(force_image=True))
+        sel.addWidget(self.cleanup_paste_button)
         clear_sel=QPushButton('Снять выделение   Esc')
         clear_sel.clicked.connect(self.cancel_selection)
         sel.addWidget(clear_sel)
@@ -935,9 +939,7 @@ class EditorWindow(QMainWindow):
         self.text_input.textChanged.connect(self._text_in_panel)
         self.text_input.setMaximumHeight(230)
         tl.addWidget(self.text_input)
-        self.insert_button=QPushButton('Создать рамку текста')
-        self.insert_button.clicked.connect(self.insert_text)
-        tl.addWidget(self.insert_button)
+        # Text rectangle is drawn directly by mouse.
         tl.addStretch(1)
         self.sidebar_modes.addWidget(self.text_panel)
 
@@ -1068,31 +1070,6 @@ class EditorWindow(QMainWindow):
         self.sidebar_modes.addWidget(self.brush_panel)
         self._update_color_previews()
 
-        # Plain clipboard selection does NOT enable cleanup candidates and
-        # does NOT overwrite an image already stored on the clipboard.
-        self.clipboard_panel=QWidget()
-        self.clipboard_panel.setObjectName('clipboardPane')
-        self.clipboard_panel.setStyleSheet(
-            'QWidget#clipboardPane {background:#1b2430;}')
-        cp=QVBoxLayout(self.clipboard_panel)
-        cp.setContentsMargins(2,2,2,4)
-        cp.setSpacing(9)
-        cliptitle=QLabel('Работа с фрагментами')
-        cliptitle.setStyleSheet('color:#8dcaff;font-size:16px;font-weight:500;')
-        cp.addWidget(cliptitle)
-        self.copy_button=QPushButton('Копировать')
-        self.copy_button.clicked.connect(lambda:self.copy_fragment(force_image=True))
-        cp.addWidget(self.copy_button)
-        self.clip_paste_button=QPushButton('Вставить изображение')
-        self.clip_paste_button.clicked.connect(
-            lambda:self.paste_fragment(force_image=True))
-        cp.addWidget(self.clip_paste_button)
-        self.cancel_selection_button=QPushButton('Снять выделение')
-        self.cancel_selection_button.clicked.connect(self.cancel_selection)
-        cp.addWidget(self.cancel_selection_button)
-        cp.addStretch()
-        self.sidebar_modes.addWidget(self.clipboard_panel)
-
         # One coherent toolbar: modes, clipboard, history and visible zoom.
         bar=QToolBar('Редактор')
         bar.setObjectName('editorToolbar')
@@ -1108,7 +1085,6 @@ class EditorWindow(QMainWindow):
 
         self.actions={}
         for key,label,shortcut,ico in (
-            ('new','Выделить','Alt+S',toolbar_icon('select')),
             ('cleanup','Очистка','Alt+C',toolbar_icon('cleanup')),
             ('text','Текст','Alt+T',toolbar_icon('text')),
             ('brushes','Кисти','Alt+B',brush_icon('marker')),
@@ -1116,9 +1092,7 @@ class EditorWindow(QMainWindow):
             a=QAction(ico,label,self)
             a.setCheckable(True)
             if shortcut:a.setShortcut(QKeySequence(shortcut))
-            if key=='text':
-                a.triggered.connect(self.insert_text)
-            elif key=='brushes':
+            if key=='brushes':
                 a.triggered.connect(lambda:self.set_tool(self.last_brush))
             else:
                 a.triggered.connect(lambda checked=False,t=key:self.set_tool(t))
@@ -1173,8 +1147,6 @@ class EditorWindow(QMainWindow):
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu=QMenu(self.more_button)
         menu.addAction('Расширенные настройки очистки…',self.show_advanced_cleanup)
-        menu.addAction('Добавить область очистки вручную',
-                       lambda:self.set_tool('cleanup_add'))
         self.more_button.setMenu(menu)
         bar.addWidget(self.more_button)
         self.canvas.zoom_changed.connect(self._update_zoom_combo)
@@ -1205,73 +1177,63 @@ class EditorWindow(QMainWindow):
         self.canvas.cleanup_box_toggled.connect(self._toggle_cleanup_box)
         self.canvas.cleanup_box_drawn.connect(self._manual_cleanup_box)
         self.canvas.paste_confirmed.connect(self.commit_paste)
-        self.set_tool('new')
+        self.set_tool('cleanup')
         self._update_history_actions()
 
     def _mark(self):
         self.dirty=True
         self.setWindowTitle('* Редактор — '+self.path.name)
 
-    def _checkpoint(self):
-        self.history.append((self.working.copy(),deepcopy(self.layers),self.selection,
-                             list(self._cleanup_done_boxes),set(self._cleanup_done_selections)))
-        if len(self.history)>12:self.history.pop(0)
+    def _capture_domain(self, domain):
+        if domain == 'text':
+            return deepcopy(self.layers)
+        if domain == 'image':
+            return (self.working.copy(), list(self._cleanup_done_boxes),
+                    set(self._cleanup_done_selections))
+        raise ValueError(domain)
+
+    def _restore_domain(self, domain, state):
+        if domain == 'text':
+            self.layers = deepcopy(state)
+            self.selected_text = -1
+        elif domain == 'image':
+            self.working = state[0].copy()
+            self._cleanup_done_boxes = list(state[1])
+            self._cleanup_done_selections = set(state[2])
+        else:
+            raise ValueError(domain)
+        self._reset_cleanup(clear_selection=True)
+        self._sync()
+
+    def _checkpoint(self, domain='image'):
+        self.history.append((domain, self._capture_domain(domain)))
+        if len(self.history)>64:self.history.pop(0)
         self.future.clear()
         self._mark()
         self._update_history_actions()
 
     def _undo_shortcut(self):
-        if self.canvas.tool=='text' and self._focused_text():
-            if self.text_input.hasFocus():
-                self.text_input.undo()
-            elif self.canvas.text_edit_item is not None:
-                self.canvas.text_edit_item.document().undo()
-            return
         self.undo()
 
     def _redo_shortcut(self):
-        if self.canvas.tool=='text' and self._focused_text():
-            if self.text_input.hasFocus():
-                self.text_input.redo()
-            elif self.canvas.text_edit_item is not None:
-                self.canvas.text_edit_item.document().redo()
-            return
         self.redo()
 
     def undo(self):
-        # Toolbar undo is an editor transaction, not whichever stale text
-        # widget happens to retain focus from an earlier editing session.
         if self.canvas.paste_item is not None:
             self.canvas.cancel_paste()
-            self.set_tool('new')
+            self.set_tool('cleanup')
             return
-        if not self.history:
-            return
-        self._reset_cleanup()
-        self.future.append((self.working.copy(),deepcopy(self.layers),self.selection,
-                            list(self._cleanup_done_boxes),set(self._cleanup_done_selections)))
-        (self.working,self.layers,self.selection,
-         self._cleanup_done_boxes,self._cleanup_done_selections)=self.history.pop()
-        self.selected_text=-1
-        self.canvas.cancel_paste()
-        self._sync()
-        self._reset_cleanup(clear_selection=False)
-        self.canvas.set_selection(self.selection)
+        if not self.history:return
+        domain, previous = self.history.pop()
+        self.future.append((domain, self._capture_domain(domain)))
+        self._restore_domain(domain, previous)
         self._update_history_actions()
 
     def redo(self):
-        if not self.future:
-            return
-        self._reset_cleanup()
-        self.history.append((self.working.copy(),deepcopy(self.layers),self.selection,
-                             list(self._cleanup_done_boxes),set(self._cleanup_done_selections)))
-        (self.working,self.layers,self.selection,
-         self._cleanup_done_boxes,self._cleanup_done_selections)=self.future.pop()
-        self.selected_text=-1
-        self.canvas.cancel_paste()
-        self._sync()
-        self._reset_cleanup(clear_selection=False)
-        self.canvas.set_selection(self.selection)
+        if not self.future:return
+        domain, next_state = self.future.pop()
+        self.history.append((domain, self._capture_domain(domain)))
+        self._restore_domain(domain, next_state)
         self._update_history_actions()
 
     def _update_history_actions(self):
@@ -1328,7 +1290,7 @@ class EditorWindow(QMainWindow):
         self._reset_cleanup(clear_selection=True)
         self.selected_text=-1
         self.canvas.set_text_layers(self.layers,-1)
-        self.set_tool('new')
+        self.set_tool('cleanup')
         self.statusBar().showMessage('Выделение отменено.',3500)
 
     def _set_brush_color(self,color):
@@ -1579,7 +1541,7 @@ class EditorWindow(QMainWindow):
         self._invalidate_cleanup_preview()
         if self.selection is None:
             self.statusBar().showMessage('Сначала выделите надпись.',6000)
-            self.set_tool('new')
+            self.set_tool('cleanup')
             return
         x,y,w,h=box
         sx,sy,sw,sh=self.selection
@@ -1592,7 +1554,7 @@ class EditorWindow(QMainWindow):
             self._cleanup_label_ids.append(None)
             self._cleanup_enabled.append(True)
             self._refresh_cleanup_overlay()
-        self.set_tool('new')
+        self.set_tool('cleanup')
 
     def preview_cleanup(self):
         if self._cleanup_preview_active:
@@ -1692,11 +1654,10 @@ class EditorWindow(QMainWindow):
             self._reset_cleanup(clear_selection=True)
         self.canvas.set_tool(tool)
         brushes=tool in (*PAINT_TOOLS,'picker')
-        section=(2 if brushes else 1 if tool in ('text','text_new')
-                 else 3 if tool in ('new','paste') else 0)
+        section=(2 if brushes else 1 if tool in ('text','text_new') else 0)
         self.sidebar_modes.setCurrentIndex(section)
         mode='brushes' if brushes else ('text' if tool in ('text','text_new') else
-                                       'cleanup' if tool=='cleanup_add' else tool)
+                                       'cleanup' if tool in ('cleanup_add','new','paste') else tool)
         for name,action in self.actions.items():
             if action.isCheckable():
                 action.setChecked(name==mode)
@@ -1742,13 +1703,13 @@ class EditorWindow(QMainWindow):
             self._in_sync=True
             self.text_input.clear()
             self._in_sync=False
-        self.set_tool('text_new')
+        self.set_tool('text')
         self.statusBar().showMessage('Протяните мышью новую рамку текста независимо от зоны очистки.',8500)
 
     def _create_text_box(self,box):
         box=clip_box(box,self.working.size)
         if box[2]<8 or box[3]<8:return
-        self._checkpoint()
+        self._checkpoint('text')
         layer=TextLayer(box=box,text=self.text_input.toPlainText(),**self._current_settings())
         self.layers.append(layer)
         self.selected_text=len(self.layers)-1
@@ -1762,9 +1723,11 @@ class EditorWindow(QMainWindow):
         if self._in_sync:return
         if 0 <= self.selected_text < len(self.layers):
             layer=self.layers[self.selected_text]
-            layer.text=self.text_input.toPlainText()
+            value=self.text_input.toPlainText()
+            if layer.text==value:return
+            self._checkpoint('text')
+            layer.text=value
             self.canvas.update_live_text(layer)
-            self._mark()
 
     def _load_layer_settings(self,layer):
         old_sync=self._in_sync
@@ -1796,15 +1759,16 @@ class EditorWindow(QMainWindow):
 
     def _text_in_canvas(self,value):
         if self.selected_text<0 or self.selected_text>=len(self.layers):return
+        if self.layers[self.selected_text].text==value:return
+        self._checkpoint('text')
         self.layers[self.selected_text].text=value
         self._in_sync=True
         self.text_input.setPlainText(value)
         self._in_sync=False
-        self._mark()
 
     def _begin_text_geometry(self):
         if 0 <= self.selected_text < len(self.layers):
-            self._checkpoint()
+            self._checkpoint('text')
 
     def _finish_text_geometry(self):
         if 0 <= self.selected_text < len(self.layers):
@@ -1830,9 +1794,10 @@ class EditorWindow(QMainWindow):
         self._update_color_previews()
         if 0<=self.selected_text<len(self.layers):
             layer=self.layers[self.selected_text]
-            for key,val in settings.items():setattr(layer,key,val)
-            self.canvas.update_live_text(layer)
-            self._mark()
+            if any(getattr(layer,key)!=val for key,val in settings.items()):
+                self._checkpoint('text')
+                for key,val in settings.items():setattr(layer,key,val)
+                self.canvas.update_live_text(layer)
 
     def choose_text_color(self):
         chosen=QColorDialog.getColor(self.text_color,self,'Цвет текста')
@@ -1892,7 +1857,7 @@ class EditorWindow(QMainWindow):
             self.set_tool('new')
             return
         if 0<=self.selected_text<len(self.layers) and self.canvas.tool=='text':
-            self._checkpoint()
+            self._checkpoint('text')
             self.layers.pop(self.selected_text)
             self.selected_text=-1
             self._sync()

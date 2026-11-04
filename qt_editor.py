@@ -380,6 +380,7 @@ class ImageCanvas(QGraphicsView):
             content.setFont(font_for(layer))
             content.setDefaultTextColor(QColor(layer.color))
             content.document().setDocumentMargin(0)
+            content.document().setUndoRedoEnabled(False)
             content.setTextWidth(max(1, w-6))
             content.document().setDefaultTextOption(text_option(layer))
             content.setPlainText(layer.text)
@@ -935,6 +936,7 @@ class EditorWindow(QMainWindow):
                                self.align_buttons['left']).setChecked(True)
         tl.addLayout(align_row)
         self.text_input=QPlainTextEdit()
+        self.text_input.setUndoRedoEnabled(False)
         self.text_input.setPlaceholderText('Введите или вставьте перевод')
         self.text_input.textChanged.connect(self._text_in_panel)
         self.text_input.setMaximumHeight(230)
@@ -1211,7 +1213,7 @@ class EditorWindow(QMainWindow):
 
     def _checkpoint(self, domain='image'):
         self.history.append((domain, self._capture_domain(domain)))
-        if len(self.history)>64:self.history.pop(0)
+        if len(self.history)>12:self.history.pop(0)
         self.future.clear()
         self._mark()
         self._update_history_actions()

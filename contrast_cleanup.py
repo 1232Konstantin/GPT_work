@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-Mode = Literal['dark', 'light', 'outline', 'outline_dark']
+Mode = Literal['dark', 'light', 'outline', 'outline_dark', 'flat']
 
 
 @dataclass
@@ -84,6 +84,32 @@ def segment_ink(image:Image.Image, region:tuple[int,int,int,int], mode:Mode='dar
         z=np.zeros((H,W),dtype=np.uint8)
         return Segmentation(z,z.copy(),z.copy(),rgb.copy())
     crop=rgb[y0:y1,x0:x1]
+    if mode == 'flat':
+        # Small fragments are often dominated by glyph pixels. Use only
+        # the rectangle boundary to estimate background brightness.
+        lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB)
+        border = np.concatenate((lab[0,:,:],lab[-1,:,:],
+                                 lab[1:-1,0,:],lab[1:-1,-1,:]),axis=0)
+        base = np.median(border.astype(np.float32),axis=0)
+        lum = lab[:,:,0].astype(np.float32)
+        darker = lum < base[0] - dark_threshold
+        lighter = lum > base[0] + light_threshold
+        core = _components(darker | lighter, None, min_area=2,
+                           max_fraction=.80)
+        if grow > 0:
+            core = cv2.dilate(core,_kernel(2*grow+1))
+        mask = np.zeros((H,W),dtype=np.uint8)
+        mask[y0:y1,x0:x1] = core
+        seeds_dark = np.zeros_like(mask)
+        seeds_light = np.zeros_like(mask)
+        seeds_dark[y0:y1,x0:x1] = np.uint8(darker)*255
+        seeds_light[y0:y1,x0:x1] = np.uint8(lighter)*255
+        bg_lab = np.uint8(np.clip(base,0,255)).reshape(1,1,3)
+        bg_rgb = cv2.cvtColor(np.broadcast_to(bg_lab,crop.shape).copy(),
+                              cv2.COLOR_LAB2RGB)
+        background = rgb.copy()
+        background[y0:y1,x0:x1] = bg_rgb
+        return Segmentation(mask,seeds_dark,seeds_light,background)
     score_dark,score_light,bg=_contrast(crop)
     lab = cv2.cvtColor(crop,cv2.COLOR_RGB2LAB)
     L=lab[:,:,0].astype(np.float32)

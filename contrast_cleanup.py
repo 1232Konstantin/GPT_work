@@ -80,7 +80,7 @@ def segment_ink(image:Image.Image, region:tuple[int,int,int,int], mode:Mode='dar
     xx,yy,ww,hh=(int(t) for t in region)
     x0,y0=max(0,xx),max(0,yy)
     x1,y1=min(W,xx+ww),min(H,yy+hh)
-    if x1-x0<10 or y1-y0<10:
+    if x1-x0<(4 if mode=='flat' else 10) or y1-y0<(4 if mode=='flat' else 10):
         z=np.zeros((H,W),dtype=np.uint8)
         return Segmentation(z,z.copy(),z.copy(),rgb.copy())
     crop=rgb[y0:y1,x0:x1]

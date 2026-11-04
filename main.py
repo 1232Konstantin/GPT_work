@@ -43,23 +43,23 @@ def gui_self_test(app):
             if viewer.actual_action.text() != '100%':
                 raise RuntimeError('Viewer must expose a clearly labelled 100% button')
             assert not viewer.library_panel.isVisible(), 'Viewer must start image-first'
-            assert editor.canvas.tool=='new', 'Editor must start in manual rectangle mode'
+            assert editor.canvas.tool=='cleanup', 'Editor must start in cleanup rectangle mode'
             # Full paint-style editor smoke: rectangle goes to image clipboard,
             # text stays inside its box, other pixels remain unchanged.
             print('Single-window diagnostic:',viewer.mode_stack.currentWidget() is editor,
                   'editor.isWindow=',editor.isWindow(),flush=True)
             if viewer.mode_stack.currentWidget() is not editor or editor.isWindow():
                 raise RuntimeError('Editor must open inside the same top-level window')
-            editor.set_tool('new')
+            editor.set_tool('cleanup')
             editor._selected((130, 80, 125, 80))
-            if editor._cleanup_candidates or editor.canvas.cleanup_boxes:
-                raise RuntimeError('Plain selection must not start cleanup detection')
+            if not app.clipboard().mimeData().hasImage():
+                raise RuntimeError('Cleanup selection must copy fragment automatically')
             editor.copy_action.trigger()
             if not app.clipboard().mimeData().hasImage():
                 raise RuntimeError('Copy action did not copy selected image')
             editor.text_input.setPlainText('Hello\\nworld!')
             editor.insert_text()
-            if editor.canvas.tool != 'text_new':
+            if editor.canvas.tool != 'text':
                 raise RuntimeError('Text tool must wait for independent rectangle')
             editor._create_text_box((145, 90, 110, 70))
             if len(editor.layers) != 1 or editor.canvas.text_edit_item is None:
@@ -212,8 +212,9 @@ def gui_self_test(app):
             # UI regressions: simplified cleanup and a distinct Paint-3D-like
             # brushes page. Test actual controls, not only the backing methods.
             from PySide6.QtCore import QPointF
-            editor.set_tool('new')
-            assert editor.sidebar_modes.currentWidget() is editor.clipboard_panel
+            editor.set_tool('cleanup')
+            assert editor.sidebar_modes.currentWidget() is editor.selection_panel
+            assert editor.sidebar_modes.count() == 3
             assert editor.selection_panel.styleSheet().find('#1b2430')>=0
             assert editor.brush_panel.widget().styleSheet().find('#1b2430')>=0
             assert not editor.undo_action.icon().isNull()
@@ -274,14 +275,13 @@ def gui_self_test(app):
             assert str(editor.settings.value('fontUnderline')).lower()=='true'
 
             # An image crop is copied as image even when the text field owns focus.
-            editor.set_tool('new')
+            editor.set_tool('cleanup')
             editor.text_input.setFocus()
             from qt_editor import qimage_from_pil
             stored=Image.new('RGBA',(9,9),'#123456')
             app.clipboard().setImage(qimage_from_pil(stored))
             editor._selected((27,22,55,41))
-            assert not editor._cleanup_candidates
-            assert app.clipboard().image().size().width()==9, 'Selection overwrote clipboard'
+            assert app.clipboard().image().size().width()==55, 'Cleanup selection failed to overwrite clipboard'
             menu=editor._make_context_menu(QPoint(100,100))
             item_labels=[a.text() for a in menu.actions() if not a.isSeparator()]
             assert item_labels==['Копировать','Вырезать','Вставить','Снять выделение'], item_labels

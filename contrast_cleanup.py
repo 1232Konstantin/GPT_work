@@ -280,3 +280,89 @@ def confirmed_mask(original_mask: np.ndarray, rect:tuple[int,int,int,int], label
         if right>left and bottom>top:
             region[top:bottom,left:right]=255
     return out
+
+def _border_background(crop: np.ndarray) -> np.ndarray:
+    """Estimate a flat background from crop edges, not from its text-filled centre."""
+    h,w=crop.shape[:2]
+    t=max(1,min(3,min(h,w)//8))
+    edges=np.concatenate((crop[:t].reshape(-1,3),
+                          crop[-t:].reshape(-1,3),
+                          crop[t:-t,:t].reshape(-1,3),
+                          crop[t:-t,-t:].reshape(-1,3)),axis=0)
+    if not edges.size:
+        return np.median(crop.reshape(-1,3),axis=0).astype(np.uint8)
+    lab=cv2.cvtColor(np.uint8(edges.reshape(1,-1,3)),cv2.COLOR_RGB2LAB).reshape(-1,3)
+    quant=(lab//16).astype(np.int32)
+    unique,counts=np.unique(quant,axis=0,return_counts=True)
+    best=unique[int(np.argmax(counts))]
+    candidates=edges[np.all(quant==best,axis=1)]
+    if len(candidates)<max(3,len(edges)//10):
+        candidates=edges
+    return np.uint8(np.round(np.median(candidates,axis=0)))
+
+
+def segment_flat_ink(image:Image.Image,region:tuple[int,int,int,int],
+                     mode:Mode='dark',*,grow:int=1,contrast:int=20):
+    """Detect glyphs by their deviation from the small crop's BORDER colour."""
+    rgb=np.asarray(image.convert('RGB'))
+    H,W=rgb.shape[:2]
+    x,y,w,h=(int(v) for v in region)
+    x0=max(0,min(W,x));y0=max(0,min(H,y))
+    x1=max(x0,min(W,x+w));y1=max(y0,min(H,y+h))
+    zero=np.zeros((H,W),dtype=np.uint8)
+    if x1-x0<4 or y1-y0<4:
+        return Segmentation(zero,zero.copy(),zero.copy(),rgb.copy())
+    crop=rgb[y0:y1,x0:x1]
+    background=_border_background(crop)
+    lab=cv2.cvtColor(crop,cv2.COLOR_RGB2LAB).astype(np.int16)
+    bg_lab=cv2.cvtColor(background.reshape(1,1,3),
+                         cv2.COLOR_RGB2LAB)[0,0].astype(np.int16)
+    delta=lab-bg_lab
+    lum=delta[:,:,0]
+    distance=np.sqrt(np.sum(delta.astype(np.float32)**2,axis=2))
+    ink_distance=distance>=max(12,int(contrast))
+    dark=(lum<=-max(12,int(contrast)))|((lum<=-8)&ink_distance)
+    light=(lum>=max(12,int(contrast)))|((lum>=8)&ink_distance)
+    if mode=='dark':
+        primary=dark
+    elif mode=='light':
+        primary=light
+    elif mode in ('outline','outline_dark'):
+        primary=dark|light|ink_distance
+        primary=cv2.morphologyEx(primary.astype(np.uint8),
+                                  cv2.MORPH_CLOSE,_kernel(3))>0
+    else:
+        raise ValueError(mode)
+    selected=_components(primary,None,min_area=1,max_fraction=.94)
+    if grow>0:
+        selected=cv2.dilate(selected,_kernel(2*grow+1))
+    full=zero.copy()
+    full[y0:y1,x0:x1]=selected
+    d=zero.copy();d[y0:y1,x0:x1]=np.uint8(dark)*255
+    l=zero.copy();l[y0:y1,x0:x1]=np.uint8(light)*255
+    estimate=rgb.copy()
+    estimate[y0:y1,x0:x1]=background
+    return Segmentation(full,d,l,estimate)
+
+
+def repair_flat_background(image:Image.Image,mask:np.ndarray,
+                           region:tuple[int,int,int,int]) -> Image.Image:
+    """Replace approved ink pixels with edge-estimated background, nowhere else."""
+    source=np.asarray(image.convert('RGB'))
+    if mask.shape!=source.shape[:2]:
+        raise ValueError('Mask size must match image')
+    x,y,w,h=(int(v) for v in region)
+    x0=max(0,min(source.shape[1],x))
+    y0=max(0,min(source.shape[0],y))
+    x1=max(x0,min(source.shape[1],x+w))
+    y1=max(y0,min(source.shape[0],y+h))
+    if x1<=x0 or y1<=y0 or not np.any(mask):
+        return image.copy()
+    background=_border_background(source[y0:y1,x0:x1])
+    output=np.asarray(image.convert('RGBA')).copy()
+    roi=np.zeros(mask.shape,dtype=bool)
+    roi[y0:y1,x0:x1]=True
+    output[(mask>0)&roi,:3]=background
+    if image.mode=='RGBA':
+        return Image.fromarray(output,'RGBA')
+    return Image.fromarray(output[:,:,:3],'RGB')

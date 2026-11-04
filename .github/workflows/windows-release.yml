@@ -47,13 +47,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = 'v0.8.0-preview.1'
+          $tag = 'v0.9.0-preview.1'
           $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_*_win64.exe | Select-Object -First 1
           if (-not $setup) { throw 'No setup file for preview release' }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $setup.FullName --clobber
           } else {
-            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.8.0 (editor workflow and UI correction)'  --notes 'Reworked UI modes: separate clipboard selection and text cleanup, clean selection reset between regions, movable/resizable text boxes with Undo/Redo, functional context image clipboard, dark theme and readable toolbar icons, visible zoom, optimized background thumbnails. Includes Qt mouse-driven workflow tests.' --prerelease
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.9.0 (independent undo commands and flat cleanup)'  --notes 'Three working edit panes: Cleanup auto-copies selected image region, Text creates text rectangles by dragging, Brushes unchanged. Per-operation raster/text undo history is independent. Added small-flat-background cleanup option using selection borders. Clipboard paste is in Cleanup pane. Tests cover consecutive cleanups, text commands, clipboard paste, brush undo and GUI mouse interactions.' --prerelease
           }
           if ($LASTEXITCODE -ne 0) { throw 'Preview release publication failed' }

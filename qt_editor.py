@@ -1186,7 +1186,7 @@ class EditorWindow(QMainWindow):
 
     def _capture_domain(self, domain):
         if domain == 'text':
-            return deepcopy(self.layers)
+            return (deepcopy(self.layers), self.selected_text)
         if domain == 'image':
             return (self.working.copy(), list(self._cleanup_done_boxes),
                     set(self._cleanup_done_selections))
@@ -1194,8 +1194,8 @@ class EditorWindow(QMainWindow):
 
     def _restore_domain(self, domain, state):
         if domain == 'text':
-            self.layers = deepcopy(state)
-            self.selected_text = -1
+            self.layers = deepcopy(state[0])
+            self.selected_text = state[1] if 0 <= state[1] < len(self.layers) else -1
         elif domain == 'image':
             self.working = state[0].copy()
             self._cleanup_done_boxes = list(state[1])
@@ -1203,6 +1203,10 @@ class EditorWindow(QMainWindow):
         else:
             raise ValueError(domain)
         self._reset_cleanup(clear_selection=True)
+        if self.selected_text == -1 and domain == 'text':
+            self._in_sync = True
+            self.text_input.clear()
+            self._in_sync = False
         self._sync()
 
     def _checkpoint(self, domain='image'):
@@ -1439,7 +1443,7 @@ class EditorWindow(QMainWindow):
             self.working=self.working.convert('RGB')
         self.canvas.cancel_paste()
         self._sync()
-        self.set_tool('new')
+        self.set_tool('cleanup')
         self._update_history_actions()
 
     def escape_tool(self):
@@ -1709,8 +1713,9 @@ class EditorWindow(QMainWindow):
     def _create_text_box(self,box):
         box=clip_box(box,self.working.size)
         if box[2]<8 or box[3]<8:return
+        value='' if self.selected_text>=0 else self.text_input.toPlainText()
         self._checkpoint('text')
-        layer=TextLayer(box=box,text=self.text_input.toPlainText(),**self._current_settings())
+        layer=TextLayer(box=box,text=value,**self._current_settings())
         self.layers.append(layer)
         self.selected_text=len(self.layers)-1
         self.set_tool('text')
@@ -1854,7 +1859,7 @@ class EditorWindow(QMainWindow):
             return
         if self.canvas.paste_item:
             self.canvas.cancel_paste()
-            self.set_tool('new')
+            self.set_tool('cleanup')
             return
         if 0<=self.selected_text<len(self.layers) and self.canvas.tool=='text':
             self._checkpoint('text')

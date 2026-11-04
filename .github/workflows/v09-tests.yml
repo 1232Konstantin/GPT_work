@@ -1,0 +1,25 @@
+name: v0.9 regression tests
+on:
+  push:
+    branches: [v0.9-development]
+  workflow_dispatch:
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libglib2.0-0
+          python -m pip install -r requirements.txt
+      - name: Compile and regression-test
+        run: |
+          python -m compileall -q .
+          python -m pytest -q tests

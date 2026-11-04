@@ -56,6 +56,7 @@ def test_image_and_text_commands_are_independent(tmp_path):
         assert editor.working.getpixel((11,10)) == (0,0,0)
         assert editor.layers[0].text == 'hello'
     finally:
+        editor.dirty = False
         editor.close()
 
 
@@ -76,4 +77,5 @@ def test_text_edit_does_not_checkpoint_raster(tmp_path):
         editor.redo()
         assert editor.layers[-1].text == 'one'
     finally:
+        editor.dirty = False
         editor.close()

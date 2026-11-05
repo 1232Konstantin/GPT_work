@@ -61,6 +61,17 @@ def brush_icon(kind: str) -> QIcon:
                                   QPointF(43,27),QPointF(27,37)]))
         p.setBrush(QColor("#3299c6"))
         p.drawRoundedRect(QRectF(14,37,29,8),3,3)
+    elif kind=="blur":
+        # Three soft concentric rings: recognisable at toolbar and cursor size.
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for radius,alpha in ((18,65),(13,130),(8,245)):
+            c=QColor("#93d8f2")
+            c.setAlpha(alpha)
+            p.setPen(QPen(c,3))
+            p.drawEllipse(QPointF(27,27),radius,radius)
+        p.setPen(QPen(QColor("#e9f6ff"),2))
+        p.drawLine(27,18,27,36)
+        p.drawLine(18,27,36,27)
     elif kind=="smudge":
         p.setBrush(QColor("#7e98ba"))
         p.drawRoundedRect(QRectF(12,29,30,7),3,3)
@@ -77,8 +88,8 @@ def brush_icon(kind: str) -> QIcon:
 
 
 def picker_cursor_pixmap(color: QColor) -> QPixmap:
-    """Magnified pixel-color bubble and fixed pixel-accurate crosshair."""
-    pix=QPixmap(98,120)
+    """Pixel colour preview bubble, displayed above the ordinary arrow cursor."""
+    pix=QPixmap(98,70)
     pix.fill(Qt.GlobalColor.transparent)
     p=QPainter(pix)
     p.setRenderHint(QPainter.RenderHint.Antialiasing,True)
@@ -93,14 +104,5 @@ def picker_cursor_pixmap(color: QColor) -> QPixmap:
     f.setBold(True)
     p.setFont(f)
     p.drawText(QRectF(6,39,86,18),Qt.AlignmentFlag.AlignCenter,color.name().upper())
-    p.setPen(QPen(QColor("#ffffff"),3))
-    p.drawLine(49,87,49,119)
-    p.drawLine(31,104,67,104)
-    p.setPen(QPen(QColor("#15263f"),1.7))
-    p.drawLine(49,68,49,101)
-    p.drawLine(31,85,67,85)
-    p.setPen(QPen(QColor("#ffffff"),1))
-    p.setBrush(color)
-    p.drawRect(QRectF(46,101,6,6))
     p.end()
     return pix

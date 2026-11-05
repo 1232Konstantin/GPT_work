@@ -67,6 +67,7 @@ def gui_self_test(app):
                 raise RuntimeError('Bounded text editor failed to initialize')
             editor.font_size.setValue(36)
             editor._create_text_box((270, 130, 95, 75))
+            editor._text_in_canvas('SECOND CAPTION')
             editor.font_size.setValue(22)
             editor._choose_text_layer(0)
             if editor.font_size.value() != 36 or editor.selected_text != 0:

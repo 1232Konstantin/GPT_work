@@ -1826,7 +1826,9 @@ class EditorWindow(QMainWindow):
         if not 0 <= index < len(self.layers):return
         if index != self.selected_text:
             self.commit_text()
-        self._text_before=self._capture_domain('text')
+            self._text_before=self._capture_domain('text')
+        elif self._text_before is None:
+            self._text_before=self._capture_domain('text')
         self.selected_text=index
         self._load_layer_settings(self.layers[index])
         self.set_tool('text')
@@ -1897,18 +1899,25 @@ class EditorWindow(QMainWindow):
     def _painted(self,event):
         start,end,tool,size,first=event
         if start is None:
+            if self._stroke_in_progress and self._stroke_before is not None:
+                before=self._stroke_before
+                if self.working.tobytes()!=before[0].tobytes():
+                    self._record_transaction('image',before)
+            self._stroke_before=None
             self._stroke_in_progress=False
             self._refresh_pixmap()
             return
         if first or not self._stroke_in_progress:
-            self._checkpoint()
+            self._stroke_before=self._capture_domain('image')
             self._stroke_in_progress=True
         a=(start.x(),start.y())
         b=(end.x(),end.y())
-        self.working=draw_stroke(
-            self.working,self.original,a,b,size,
-            self.brush_color.getRgb()[:3],tool,
-            self.brush_opacity.value())
+        # Filling is a click operation; dragging must not flood other areas.
+        if tool!='fill' or first:
+            self.working=draw_stroke(
+                self.working,self.original,a,b,size,
+                self.brush_color.getRgb()[:3],tool,
+                self.brush_opacity.value())
         if not self._render_timer.isActive():
             self._render_timer.start(35)
 

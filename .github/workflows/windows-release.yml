@@ -4,6 +4,7 @@ on:
     branches:
       - main
       - v0.9-development
+      - v0.10-development
     tags:
       - 'v*'
   workflow_dispatch:
@@ -58,6 +59,22 @@ jobs:
             gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.9.0 preview' --notes 'Three editor modes; independent image/text Undo/Redo; flat-background cleanup for small selections; mouse-driven cleanup and text rectangles.' --prerelease
           }
           if ($LASTEXITCODE -ne 0) { throw 'v0.9 preview release publication failed' }
+      - name: Publish v0.10 preview from development branch
+        if: github.ref == 'refs/heads/v0.10-development'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v0.10.0-preview.1'
+          $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_0.10.0_win64.exe | Select-Object -First 1
+          if (-not $setup) { throw 'No v0.10 installer' }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $setup.FullName --clobber
+          } else {
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.10.0 preview' --notes 'Committed captions, transaction-based Undo/Redo, five distinct brushes and opaque clipboard paste.' --prerelease
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'v0.10 preview release publication failed' }
       - name: Publish preview installer on main
         if: github.ref == 'refs/heads/main'
         shell: pwsh

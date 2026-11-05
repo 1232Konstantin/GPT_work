@@ -79,3 +79,40 @@ def test_text_edit_does_not_checkpoint_raster(tmp_path):
     finally:
         editor.dirty = False
         editor.close()
+
+
+def test_new_text_frame_preserves_existing_text_and_pixels(tmp_path):
+    """A second rectangle must never clear or replace the first caption."""
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / 'page.png'
+    Image.new('RGB',(250,150),'white').save(source)
+    editor = EditorWindow(source)
+    try:
+        editor.set_tool('text')
+        editor._create_text_box((10,10,100,65))
+        editor._text_in_canvas('FIRST CAPTION')
+        assert editor.layers[0].text == 'FIRST CAPTION'
+        assert editor.canvas.text_edit_item.toPlainText() == 'FIRST CAPTION'
+
+        from qt_editor import composite_text
+        before = composite_text(editor.working, editor.layers)
+        editor._create_text_box((130,10,100,65))
+        assert len(editor.layers) == 2
+        assert editor.layers[0].text == 'FIRST CAPTION'
+        assert editor.layers[1].text == ''
+        assert editor.canvas.text_items[0].childItems()[0].toPlainText() == 'FIRST CAPTION'
+        after = composite_text(editor.working, editor.layers)
+        assert before.crop((10,10,110,75)).tobytes() == after.crop((10,10,110,75)).tobytes()
+
+        editor._text_in_canvas('SECOND CAPTION')
+        assert editor.layers[0].text == 'FIRST CAPTION'
+        assert editor.layers[1].text == 'SECOND CAPTION'
+        editor.undo()
+        assert editor.layers[0].text == 'FIRST CAPTION'
+        assert editor.layers[1].text == ''
+        editor.redo()
+        assert editor.layers[0].text == 'FIRST CAPTION'
+        assert editor.layers[1].text == 'SECOND CAPTION'
+    finally:
+        editor.dirty = False
+        editor.close()

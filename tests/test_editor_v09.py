@@ -70,12 +70,14 @@ def test_text_edit_does_not_checkpoint_raster(tmp_path):
         editor._text_in_canvas('one')
         editor._text_in_canvas('two')
         assert editor.layers[-1].text == 'two'
+        assert not editor.history  # neither box selection nor typing is undoable
+        editor.commit_text()
+        assert len(editor.history)==1
+        assert editor.layers[0].text == 'two'
         editor.undo()
-        assert editor.layers[-1].text == 'one'
-        editor.undo()
-        assert editor.layers[-1].text == ''
+        assert not editor.layers
         editor.redo()
-        assert editor.layers[-1].text == 'one'
+        assert editor.layers[0].text == 'two'
     finally:
         editor.dirty = False
         editor.close()
@@ -107,9 +109,11 @@ def test_new_text_frame_preserves_existing_text_and_pixels(tmp_path):
         editor._text_in_canvas('SECOND CAPTION')
         assert editor.layers[0].text == 'FIRST CAPTION'
         assert editor.layers[1].text == 'SECOND CAPTION'
+        editor.commit_text()
+        assert editor.selected_text == -1
         editor.undo()
         assert editor.layers[0].text == 'FIRST CAPTION'
-        assert editor.layers[1].text == ''
+        assert len(editor.layers) == 1
         editor.redo()
         assert editor.layers[0].text == 'FIRST CAPTION'
         assert editor.layers[1].text == 'SECOND CAPTION'

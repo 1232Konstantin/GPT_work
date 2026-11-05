@@ -1226,6 +1226,7 @@ class EditorWindow(QMainWindow):
             self._cleanup_done_selections = set(state[2])
         else:
             raise ValueError(domain)
+        self._text_before = None
         self._reset_cleanup(clear_selection=True)
         if self.selected_text == -1 and domain == 'text':
             self._in_sync = True
@@ -1233,12 +1234,47 @@ class EditorWindow(QMainWindow):
             self._in_sync = False
         self._sync()
 
-    def _checkpoint(self, domain='image'):
-        self.history.append((domain, self._capture_domain(domain)))
+    def _record_transaction(self, domain, before):
+        self.history.append((domain, before))
         if len(self.history)>12:self.history.pop(0)
         self.future.clear()
         self._mark()
         self._update_history_actions()
+
+    def _checkpoint(self, domain='image'):
+        self._record_transaction(domain,self._capture_domain(domain))
+
+    def eventFilter(self,obj,event):
+        if (obj is self.text_input and event.type()==QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return,Qt.Key.Key_Enter)
+                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self.commit_text()
+            return True
+        return super().eventFilter(obj,event)
+
+    def commit_text(self):
+        """A complete caption is one undoable transaction, never one per key."""
+        if self._text_before is None and self.selected_text < 0:
+            return
+        before = self._text_before
+        if before is None:
+            before = self._capture_domain('text')
+        # Empty new rectangles are transient GUI state, not image changes.
+        if (0 <= self.selected_text < len(self.layers)
+                and not self.layers[self.selected_text].text
+                and len(self.layers)>len(before[0])):
+            self.layers.pop(self.selected_text)
+        changed = self.layers != before[0]
+        self.selected_text = -1
+        self._text_before = None
+        self._in_sync = True
+        self.text_input.clear()
+        self._in_sync = False
+        self._sync()
+        if changed:
+            self._record_transaction('text',before)
+        self.canvas.setFocus()
+
 
     def _undo_shortcut(self):
         self.undo()
@@ -1247,6 +1283,8 @@ class EditorWindow(QMainWindow):
         self.redo()
 
     def undo(self):
+        if self._text_before is not None:
+            self.commit_text()
         if self.canvas.paste_item is not None:
             self.canvas.cancel_paste()
             self.set_tool('cleanup')
@@ -1258,6 +1296,8 @@ class EditorWindow(QMainWindow):
         self._update_history_actions()
 
     def redo(self):
+        if self._text_before is not None:
+            self.commit_text()
         if not self.future:return
         domain, next_state = self.future.pop()
         self.history.append((domain, self._capture_domain(domain)))
@@ -1662,7 +1702,7 @@ class EditorWindow(QMainWindow):
             tool=self.last_brush
         if self.canvas.paste_item and tool!='paste':
             self.commit_paste()
-        if tool in PAINT_TOOLS:
+        if tool in VISIBLE_PAINT_TOOLS:
             self.last_brush=tool
             self.settings.setValue('lastBrush',tool)
             self.brush_title.setText(self.brush_labels.get(tool,'Кисти'))
@@ -1674,6 +1714,8 @@ class EditorWindow(QMainWindow):
                 self.brush_slider.setValue(size)
             self.canvas.brush_size=size
         previous=self.canvas.tool
+        if previous=='text' and tool!='text':
+            self.commit_text()
         # Each mode owns its own selection state; never retain active cleanup
         # candidates when switching to text, paste or ordinary copy.
         if tool not in ('cleanup','cleanup_add') and previous in ('cleanup','cleanup_add'):
@@ -1726,6 +1768,7 @@ class EditorWindow(QMainWindow):
     def insert_text(self):
         """Text placement does not reuse the image selection rectangle."""
         self.commit_paste()
+        self.commit_text()
         if 0 <= self.selected_text < len(self.layers):
             self.selected_text=-1
             self._in_sync=True
@@ -1737,9 +1780,10 @@ class EditorWindow(QMainWindow):
     def _create_text_box(self,box):
         box=clip_box(box,self.working.size)
         if box[2]<8 or box[3]<8:return
-        value='' if self.selected_text>=0 else self.text_input.toPlainText()
-        self._checkpoint('text')
-        layer=TextLayer(box=box,text=value,**self._current_settings())
+        # Finish the previous caption before opening a fresh, empty box.
+        self.commit_text()
+        self._text_before = self._capture_domain('text')
+        layer=TextLayer(box=box,text='',**self._current_settings())
         self.layers.append(layer)
         self.selected_text=len(self.layers)-1
         self.set_tool('text')
@@ -1754,7 +1798,8 @@ class EditorWindow(QMainWindow):
             layer=self.layers[self.selected_text]
             value=self.text_input.toPlainText()
             if layer.text==value:return
-            self._checkpoint('text')
+            if self._text_before is None:
+                self._text_before=self._capture_domain('text')
             layer.text=value
             self.canvas.update_live_text(layer)
 
@@ -1779,6 +1824,9 @@ class EditorWindow(QMainWindow):
 
     def _choose_text_layer(self,index):
         if not 0 <= index < len(self.layers):return
+        if index != self.selected_text:
+            self.commit_text()
+        self._text_before=self._capture_domain('text')
         self.selected_text=index
         self._load_layer_settings(self.layers[index])
         self.set_tool('text')
@@ -1789,7 +1837,8 @@ class EditorWindow(QMainWindow):
     def _text_in_canvas(self,value):
         if self.selected_text<0 or self.selected_text>=len(self.layers):return
         if self.layers[self.selected_text].text==value:return
-        self._checkpoint('text')
+        if self._text_before is None:
+            self._text_before=self._capture_domain('text')
         self.layers[self.selected_text].text=value
         self._in_sync=True
         self.text_input.setPlainText(value)
@@ -1797,11 +1846,11 @@ class EditorWindow(QMainWindow):
 
     def _begin_text_geometry(self):
         if 0 <= self.selected_text < len(self.layers):
-            self._checkpoint('text')
+            if self._text_before is None:
+                self._text_before=self._capture_domain('text')
 
     def _finish_text_geometry(self):
         if 0 <= self.selected_text < len(self.layers):
-            self._mark()
             self.canvas.set_text_layers(self.layers,self.selected_text)
             self.canvas.setFocus()
 
@@ -1824,7 +1873,8 @@ class EditorWindow(QMainWindow):
         if 0<=self.selected_text<len(self.layers):
             layer=self.layers[self.selected_text]
             if any(getattr(layer,key)!=val for key,val in settings.items()):
-                self._checkpoint('text')
+                if self._text_before is None:
+                    self._text_before=self._capture_domain('text')
                 for key,val in settings.items():setattr(layer,key,val)
                 self.canvas.update_live_text(layer)
 
@@ -1896,6 +1946,7 @@ class EditorWindow(QMainWindow):
 
     def save_png(self):
         self.commit_paste()
+        self.commit_text()
         default=self.last_saved or self.path.with_name(self.path.stem+'_edited.png')
         target,_=QFileDialog.getSaveFileName(self,'Сохранить изображение',str(default),'PNG без потерь (*.png)')
         if not target:return

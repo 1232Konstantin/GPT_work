@@ -92,7 +92,7 @@ def test_new_text_frame_preserves_existing_text_and_pixels(tmp_path):
     try:
         editor.set_tool('text')
         editor._create_text_box((10,10,100,65))
-        editor._text_in_canvas('FIRST CAPTION')
+        editor.canvas.text_edit_item.setPlainText('FIRST CAPTION')
         assert editor.layers[0].text == 'FIRST CAPTION'
         assert editor.canvas.text_edit_item.toPlainText() == 'FIRST CAPTION'
 

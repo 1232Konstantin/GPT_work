@@ -1,7 +1,7 @@
-name: v0.9 regression tests
+name: Editor regression tests
 on:
   push:
-    branches: [v0.9-development]
+    branches: [v0.9-development, v0.10-development]
   workflow_dispatch:
 jobs:
   regression:

@@ -1219,7 +1219,8 @@ class EditorWindow(QMainWindow):
     def _restore_domain(self, domain, state):
         if domain == 'text':
             self.layers = deepcopy(state[0])
-            self.selected_text = state[1] if 0 <= state[1] < len(self.layers) else -1
+            # Undo restores committed artwork, not an open editing frame.
+            self.selected_text = -1
         elif domain == 'image':
             self.working = state[0].copy()
             self._cleanup_done_boxes = list(state[1])
@@ -1353,6 +1354,8 @@ class EditorWindow(QMainWindow):
         self.clear_button.setEnabled(False)
 
     def cancel_selection(self):
+        if self._text_before is not None:
+            self.commit_text()
         if self.canvas.paste_item is not None:
             self.canvas.cancel_paste()
         self._reset_cleanup(clear_selection=True)
@@ -1945,10 +1948,16 @@ class EditorWindow(QMainWindow):
             self.set_tool('cleanup')
             return
         if 0<=self.selected_text<len(self.layers) and self.canvas.tool=='text':
-            self._checkpoint('text')
+            before = self._text_before or self._capture_domain('text')
             self.layers.pop(self.selected_text)
             self.selected_text=-1
+            self._text_before=None
+            self._in_sync=True
+            self.text_input.clear()
+            self._in_sync=False
             self._sync()
+            if self.layers!=before[0]:
+                self._record_transaction('text',before)
             return
         if self.selection:
             self._erase_image_selection()

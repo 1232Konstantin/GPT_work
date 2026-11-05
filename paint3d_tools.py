@@ -13,7 +13,7 @@ import numpy as np
 
 TOOLS = (
     "marker", "calligraphy", "oil", "watercolor", "pixel",
-    "pencil", "crayon", "restore", "spray", "fill", "smudge"
+    "pencil", "crayon", "restore", "spray", "fill", "smudge", "blur"
 )
 
 
@@ -89,7 +89,10 @@ def draw_stroke(image: Image.Image, original: Image.Image, start, end,
     patch=image.crop((left,top,right,bottom)).convert("RGBA")
     mask=Image.new("L",patch.size,0)
     draw=ImageDraw.Draw(mask)
-    if tool=="pixel":
+    if tool=="pencil" and size==1:
+        # Exactly one raster pixel at the tip for a 1px pencil.
+        draw.line((*local0,*local1),fill=255,width=1)
+    elif tool=="pixel":
         _dabs(draw,local0,local1,r,255,ellipse=False,step=max(1,r))
     elif tool=="calligraphy":
         # Nib slanted at a fixed angle, as with a calligraphic pen.
@@ -129,7 +132,14 @@ def draw_stroke(image: Image.Image, original: Image.Image, start, end,
         yy,xx=np.indices(ar.shape)
         ar[(xx*31+yy*11)%17==0]=np.uint8(ar[(xx*31+yy*11)%17==0]*.55)
         mask=Image.fromarray(ar,"L")
-    if tool=="restore":
+    if tool=="blur":
+        # A local Gaussian blur, weighted by a sharp brush-shaped mask.
+        # Unlike smudge it does not drag pixels along the stroke direction.
+        radius=max(1.0,size/5.0)
+        blurred=patch.filter(ImageFilter.GaussianBlur(radius))
+        alpha=max(0,min(100,int(opacity)))/100.0
+        patch.paste(blurred,(0,0),mask.point(lambda v:int(round(v*alpha))))
+    elif tool=="restore":
         source=original.crop((left,top,right,bottom)).convert("RGBA")
         alpha=max(0,min(100,int(opacity)))/100.0
         patch.paste(source,(0,0),mask.point(lambda v:int(round(v*alpha))))

@@ -163,6 +163,7 @@ class ImageCanvas(QGraphicsView):
         self.cleanup_boxes = []
         self.cleanup_enabled = []
         self.text_items = []
+        self.text_content_items = []  # retain Python-owned QGraphicsTextItem subclasses
         self.text_handles = []
         self.text_edit_item = None
         self.text_frame = None
@@ -390,6 +391,7 @@ class ImageCanvas(QGraphicsView):
         for frame in self.text_items:
             self.scene().removeItem(frame)
         self.text_items.clear()
+        self.text_content_items.clear()
         self.text_edit_item = None
         self.text_frame = None
         self._text_layers = layers
@@ -423,6 +425,7 @@ class ImageCanvas(QGraphicsView):
                 content.document().contentsChanged.connect(self._text_changed)
                 content.apply_requested.connect(self.text_commit_requested)
             self.text_items.append(frame)
+            self.text_content_items.append(content)
         if 0 <= selected < len(layers):
             for _ in range(8):
                 handle=self.scene().addRect(QRectF(0,0,7,7),

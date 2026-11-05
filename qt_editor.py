@@ -1899,7 +1899,7 @@ class EditorWindow(QMainWindow):
 
     def _brush_size_changed(self,value):
         self.canvas.brush_size=value
-        name=self.last_brush if self.last_brush in PAINT_TOOLS else 'marker'
+        name=self.last_brush if self.last_brush in VISIBLE_PAINT_TOOLS else 'pencil'
         self.settings.setValue('brushSize/'+name,int(value))
 
     def _painted(self,event):

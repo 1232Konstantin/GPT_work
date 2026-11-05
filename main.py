@@ -62,6 +62,7 @@ def gui_self_test(app):
             if editor.canvas.tool != 'text':
                 raise RuntimeError('Text tool must wait for independent rectangle')
             editor._create_text_box((145, 90, 110, 70))
+            editor._text_in_canvas('Hello\\nworld!')
             if len(editor.layers) != 1 or editor.canvas.text_edit_item is None:
                 raise RuntimeError('Bounded text editor failed to initialize')
             editor.font_size.setValue(36)
@@ -229,34 +230,33 @@ def gui_self_test(app):
             assert editor.clear_button.text() == 'Очистить'
             assert editor.cleanup_mode.findData('outline_dark')>=0
 
-            editor.set_tool('marker')
+            editor.set_tool('pencil')
             assert editor.sidebar_modes.currentWidget() is editor.brush_panel
-            assert len(editor.brush_tool_buttons)>=12
+            assert len(editor.brush_tool_buttons)==6
             assert editor.actions['brushes'].isChecked()
             editor.brush_diameter.setValue(23)
             editor.brush_opacity.setValue(55)
             editor._set_brush_color('#ed355e')
             assert editor.brush_color.name()=='#ed355e'
             before_brush=editor.working.copy()
-            editor._painted((QPointF(30,22),QPointF(76,22),'marker',23,True))
-            editor._painted((None,None,'marker',23,False))
+            editor._painted((QPointF(30,22),QPointF(76,22),'pencil',23,True))
+            editor._painted((None,None,'pencil',23,False))
             assert editor.working.getpixel((48,22))!=before_brush.getpixel((48,22))
             assert editor.working.getpixel((5,5))==before_brush.getpixel((5,5))
-            editor.set_tool('pencil')
+            editor.set_tool('spray')
             editor.brush_diameter.setValue(7)
-            editor.set_tool('marker')
+            editor.set_tool('pencil')
             assert editor.brush_diameter.value()==23, 'Brush thickness was not remembered per tool'
             assert editor.brush_opacity.value()==55
             editor.settings.sync()
-            assert int(editor.settings.value('brushSize/marker'))==23
+            assert int(editor.settings.value('brushSize/pencil'))==23
             assert int(editor.settings.value('brushOpacity'))==55
             editor.set_tool('picker')
             editor._pick((48,22))
-            assert editor.canvas.tool=='marker', 'Picker must return to the previous brush'
+            assert editor.canvas.tool=='pencil', 'Picker must return to the previous brush'
             assert editor.brush_color.isValid()
-            assert (editor.canvas.viewport().cursor().shape()
-                    ==__import__('PySide6.QtCore',fromlist=['Qt']).Qt.CursorShape.ArrowCursor), (
-                'Picker must restore the normal cursor after sampling')
+            assert not editor.canvas.viewport().cursor().pixmap().isNull(), (
+                'Picker must restore the chosen brush cursor after sampling')
 
             # Every text layer owns underline, alignment and other formatting.
             editor._choose_text_layer(0)

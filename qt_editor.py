@@ -354,6 +354,14 @@ class ImageCanvas(QGraphicsView):
         self._position_text_handles(box)
 
     def set_text_layers(self, layers: list[TextLayer], selected: int):
+        # Detach the outgoing editor before removing scene items: Qt may
+        # otherwise report a late document change against the new layer.
+        if self.text_edit_item is not None:
+            try:
+                self.text_edit_item.document().contentsChanged.disconnect(
+                    self._text_changed)
+            except (TypeError, RuntimeError):
+                pass
         for item in self.text_handles:
             if item.scene()==self.scene():
                 self.scene().removeItem(item)
@@ -1254,8 +1262,8 @@ class EditorWindow(QMainWindow):
     def _sync(self):
         self.canvas.set_picture(self.working)
         self.canvas.set_selection(self.selection)
-        self.canvas.set_text_layers(self.layers,self.selected_text)
         self._in_sync=True
+        self.canvas.set_text_layers(self.layers,self.selected_text)
         if 0 <= self.selected_text < len(self.layers):
             layer=self.layers[self.selected_text]
             self._load_layer_settings(layer)

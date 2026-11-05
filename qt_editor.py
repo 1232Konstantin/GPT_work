@@ -14,9 +14,9 @@ import json
 from PIL import Image
 import numpy as np
 import cv2
-from PySide6.QtCore import Qt, QRectF, QPointF, QSize, Signal, QSettings, QThreadPool, QTimer
+from PySide6.QtCore import Qt, QRectF, QPointF, QSize, Signal, QSettings, QThreadPool, QTimer, QEvent
 from PySide6.QtGui import (QAction, QColor, QFont, QPainter, QPen, QBrush,
-                           QImage, QPixmap, QKeySequence, QTextDocument, QTextOption)
+                           QImage, QPixmap, QKeySequence, QTextDocument, QTextOption, QCursor)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QSplitter, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsItem,
@@ -32,6 +32,8 @@ from qt_common import pixmap_from_pil, Task
 from qt_brush_icons import brush_icon, picker_cursor_pixmap
 from qt_toolbar_icons import toolbar_icon
 from paint3d_tools import draw_stroke, TOOLS as PAINT_TOOLS
+
+VISIBLE_PAINT_TOOLS = ('pencil', 'fill', 'spray', 'blur', 'restore')
 
 
 @dataclass
@@ -113,6 +115,19 @@ def composite_text(image: Image.Image, layers: list[TextLayer]) -> Image.Image:
     return out.convert('RGB') if image.mode == 'RGB' else out
 
 
+class EditableTextItem(QGraphicsTextItem):
+    """Return applies text; Shift+Return inserts a line."""
+    apply_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self.apply_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class ImageCanvas(QGraphicsView):
     rectangle_selected = Signal(object)
     painted = Signal(object)       # start,end,mode,brush_size
@@ -122,6 +137,7 @@ class ImageCanvas(QGraphicsView):
     text_geometry_finished = Signal()
     zoom_changed = Signal(float)
     text_edited = Signal(str)
+    text_commit_requested = Signal()
     text_layer_selected = Signal(int)
     paste_moved = Signal()
     paste_confirmed = Signal()
@@ -267,8 +283,13 @@ class ImageCanvas(QGraphicsView):
         self.tool = tool
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag
                          if tool == 'pan' else QGraphicsView.DragMode.NoDrag)
-        self.viewport().setCursor(Qt.CursorShape.BlankCursor if tool == 'picker'
-                                  else Qt.CursorShape.ArrowCursor)
+        if tool in VISIBLE_PAINT_TOOLS:
+            hotspots = {'pencil': (17,31), 'fill': (6,25),
+                        'spray': (9,9), 'blur': (16,16), 'restore': (9,24)}
+            self.viewport().setCursor(QCursor(
+                brush_icon(tool).pixmap(32,32), *hotspots[tool]))
+        else:
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         if tool != 'picker':
             self.picker_preview_item.hide()
         if self.text_edit_item is not None:
@@ -377,13 +398,13 @@ class ImageCanvas(QGraphicsView):
             x, y, w, h = layer.box
             active = i == selected
             frame = self.scene().addRect(QRectF(0, 0, w, h),
-                QPen(QColor('#55b9f7') if active else QColor(100, 175, 215, 120),
-                     1.5 if active else .8, Qt.PenStyle.DashLine))
+                QPen(QColor('#55b9f7'),1.5,Qt.PenStyle.DashLine) if active
+                else QPen(Qt.PenStyle.NoPen))
             frame.setPos(x, y)
             frame.setZValue(10)
             frame.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, True)
             frame.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            content = QGraphicsTextItem(frame)
+            content = EditableTextItem(frame)
             content.setPos(3, 2)
             content.setFont(font_for(layer))
             content.setDefaultTextColor(QColor(layer.color))
@@ -400,6 +421,7 @@ class ImageCanvas(QGraphicsView):
                 self.text_frame = frame
                 self.text_edit_item = content
                 content.document().contentsChanged.connect(self._text_changed)
+                content.apply_requested.connect(self.text_commit_requested)
             self.text_items.append(frame)
         if 0 <= selected < len(layers):
             for _ in range(8):
@@ -434,7 +456,7 @@ class ImageCanvas(QGraphicsView):
         item = self.scene().addPixmap(pixmap_from_pil(image))
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         item.setPos(*point)
-        item.setOpacity(.92)
+        item.setOpacity(1.0)
         item.setZValue(60)
         item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -571,7 +593,7 @@ class ImageCanvas(QGraphicsView):
             y=max(0,min(self.current_image.height-1,int(point.y())))
             c=QColor(*self._picker_rgb.getpixel((x,y)))
             self.picker_preview_item.setPixmap(picker_cursor_pixmap(c))
-            self.picker_preview_item.setOffset(-49,-104)
+            self.picker_preview_item.setOffset(-49,-83)
             self.picker_preview_item.setPos(point)
             self.picker_preview_item.show()
         if self.drag_mode == 'resize_paste' and self.paste_item is not None:
@@ -671,6 +693,8 @@ class EditorWindow(QMainWindow):
         self.dirty = False
         self._in_sync = False
         self._stroke_in_progress = False
+        self._stroke_before = None
+        self._text_before = None
         self._cleanup_candidates=[]
         self._cleanup_enabled=[]
         self._cleanup_done_boxes=[]
@@ -945,6 +969,7 @@ class EditorWindow(QMainWindow):
         tl.addLayout(align_row)
         self.text_input=QPlainTextEdit()
         self.text_input.setUndoRedoEnabled(False)
+        self.text_input.installEventFilter(self)
         self.text_input.setPlaceholderText('Введите или вставьте перевод')
         self.text_input.textChanged.connect(self._text_in_panel)
         self.text_input.setMaximumHeight(230)
@@ -966,7 +991,7 @@ class EditorWindow(QMainWindow):
         bl=QVBoxLayout(brush_inner)
         bl.setContentsMargins(2,2,2,4)
         bl.setSpacing(8)
-        self.brush_title=QLabel('Маркер')
+        self.brush_title=QLabel('Карандаш')
         self.brush_title.setStyleSheet('color:#8dcaff;font-size:16px;font-weight:500;')
         bl.addWidget(self.brush_title)
         tools_grid=QGridLayout()
@@ -974,11 +999,9 @@ class EditorWindow(QMainWindow):
         tools_grid.setVerticalSpacing(4)
         self.brush_tool_buttons={}
         brush_names=(
-            ('marker','Маркер'),('calligraphy','Каллиграфическое перо'),
-            ('oil','Масляная кисть'),('watercolor','Акварель'),('pixel','Пиксельное перо'),
-            ('pencil','Карандаш'),('crayon','Мелок'),
-            ('restore','Ластик — восстановление оригинала'),
-            ('spray','Баллончик'),('fill','Заливка'))
+            ('pencil','Карандаш'),('fill','Заливка'),
+            ('spray','Баллончик'),('blur','Размывайка'),
+            ('restore','Ластик — восстановление оригинала'))
         for index,(name,label) in enumerate(brush_names):
             b=QToolButton()
             b.setIcon(brush_icon(name))
@@ -991,17 +1014,7 @@ class EditorWindow(QMainWindow):
             tools_grid.addWidget(b,index//5,index%5)
         bl.addLayout(tools_grid)
         self.brush_labels=dict(brush_names)
-        self.brush_labels['smudge']='Мастихин'
         self.brush_labels['picker']='Пипетка'
-        self.smudge_button=QToolButton()
-        self.smudge_button.setIcon(brush_icon('smudge'))
-        self.smudge_button.setIconSize(QSize(24,24))
-        self.smudge_button.setText('  Мастихин')
-        self.smudge_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.smudge_button.setCheckable(True)
-        self.smudge_button.clicked.connect(lambda:self.set_tool('smudge'))
-        self.brush_tool_buttons['smudge']=self.smudge_button
-        bl.addWidget(self.smudge_button)
 
         thickness_head=QHBoxLayout()
         thickness_head.addWidget(QLabel('Толщина'))
@@ -1009,8 +1022,8 @@ class EditorWindow(QMainWindow):
         self.brush_diameter=QSpinBox()
         self.brush_diameter.setSuffix(' пкс')
         self.brush_diameter.setRange(1,160)
-        saved_tool=str(self.settings.value('lastBrush','marker'))
-        if saved_tool not in PAINT_TOOLS:saved_tool='marker'
+        saved_tool=str(self.settings.value('lastBrush','pencil'))
+        if saved_tool not in VISIBLE_PAINT_TOOLS:saved_tool='pencil'
         self.last_brush=saved_tool
         self.brush_diameter.setValue(int(self.settings.value('brushSize/'+saved_tool,5)))
         self.brush_diameter.valueChanged.connect(self._brush_size_changed)
@@ -1097,7 +1110,7 @@ class EditorWindow(QMainWindow):
         for key,label,shortcut,ico in (
             ('cleanup','Очистка','Alt+C',toolbar_icon('cleanup')),
             ('text','Текст','Alt+T',toolbar_icon('text')),
-            ('brushes','Кисти','Alt+B',brush_icon('marker')),
+            ('brushes','Кисти','Alt+B',brush_icon('pencil')),
             ('pan','Рука',None,toolbar_icon('pan'))):
             a=QAction(ico,label,self)
             a.setCheckable(True)
@@ -1181,6 +1194,7 @@ class EditorWindow(QMainWindow):
         self.canvas.text_geometry_started.connect(self._begin_text_geometry)
         self.canvas.text_geometry_finished.connect(self._finish_text_geometry)
         self.canvas.text_edited.connect(self._text_in_canvas)
+        self.canvas.text_commit_requested.connect(self.commit_text)
         self.canvas.text_layer_selected.connect(self._choose_text_layer)
         self.canvas.text_rectangle_requested.connect(self._create_text_box)
         self.canvas.context_menu_requested.connect(self._context_menu)

@@ -30,14 +30,14 @@ def test_enter_commits_one_caption_without_intermediate_undo(tmp_path):
         editor.text_input.setPlainText('abc')
         editor.text_input.setFocus()
         QTest.keyClick(editor.text_input,Qt.Key.Key_Return)
-        assert editor.text_input.toPlainText() == 'abc\\n'
-        assert editor.layers[0].text == 'abc\\n'
+        assert editor.text_input.toPlainText() == 'abc\n'
+        assert editor.layers[0].text == 'abc\n'
         assert len(editor.history)==0
         QTest.keyClick(editor.text_input,Qt.Key.Key_Return,
                        Qt.KeyboardModifier.ControlModifier)
         assert len(editor.history)==1
         assert editor.selected_text==-1
-        assert editor.layers[0].text=='abcd'
+        assert editor.layers[0].text=='abc\n'
         assert editor.canvas.text_frame is None
         assert editor.canvas.text_items
         image=composite_text(editor.working,editor.layers)
@@ -45,7 +45,7 @@ def test_enter_commits_one_caption_without_intermediate_undo(tmp_path):
         editor.undo()
         assert not editor.layers
         editor.redo()
-        assert editor.layers[0].text=='abcd'
+        assert editor.layers[0].text=='abc\n'
     finally:
         editor.dirty=False
         editor.close()
@@ -60,7 +60,7 @@ def test_enter_in_canvas_text_editor_is_newline(tmp_path):
         item.setPlainText('line1')
         item.setFocus()
         QTest.keyClick(editor.canvas.viewport(),Qt.Key.Key_Return)
-        assert item.toPlainText() == 'line1\\n'
+        assert item.toPlainText() == 'line1\n'
         assert not editor.history
         QTest.keyClick(editor.canvas.viewport(),Qt.Key.Key_Return,
                        Qt.KeyboardModifier.ControlModifier)

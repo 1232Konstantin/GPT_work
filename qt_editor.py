@@ -116,12 +116,12 @@ def composite_text(image: Image.Image, layers: list[TextLayer]) -> Image.Image:
 
 
 class EditableTextItem(QGraphicsTextItem):
-    """Return applies text; Shift+Return inserts a line."""
+    """Enter inserts a newline; Ctrl+Enter commits the caption."""
     apply_requested = Signal()
 
     def keyPressEvent(self, event):
         if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self.apply_requested.emit()
             event.accept()
             return
@@ -1251,7 +1251,7 @@ class EditorWindow(QMainWindow):
     def eventFilter(self,obj,event):
         if (obj is self.text_input and event.type()==QEvent.Type.KeyPress
                 and event.key() in (Qt.Key.Key_Return,Qt.Key.Key_Enter)
-                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self.commit_text()
             return True
         return super().eventFilter(obj,event)

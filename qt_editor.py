@@ -304,6 +304,14 @@ class ImageCanvas(QGraphicsView):
         bounds = self.scene().sceneRect()
         return QPointF(min(max(0, p.x()), bounds.width()), min(max(0, p.y()), bounds.height()))
 
+    def picker_color(self, point) -> QColor:
+        """Preview and click must sample exactly the same image and pixel."""
+        if self.current_image is None:
+            return QColor()
+        x = max(0, min(self._picker_rgb.width - 1, int(point.x())))
+        y = max(0, min(self._picker_rgb.height - 1, int(point.y())))
+        return QColor(*self._picker_rgb.getpixel((x, y)))
+
     def set_selection(self, box):
         self.selection = box
         self._draw_selection()
@@ -551,7 +559,7 @@ class ImageCanvas(QGraphicsView):
             event.accept(); return
         if self.tool in (*PAINT_TOOLS,'picker'):
             if self.tool == 'picker':
-                self.color_picked.emit((round(point.x()),round(point.y())))
+                self.color_picked.emit(self.picker_color(point))
             else:
                 self.stroke_start = point
                 self.painted.emit((point,point,self.tool,self.brush_size,True))
@@ -593,9 +601,7 @@ class ImageCanvas(QGraphicsView):
     def mouseMoveEvent(self,event):
         point = self._point(event)
         if self.tool=='picker' and self.current_image is not None:
-            x=max(0,min(self.current_image.width-1,int(point.x())))
-            y=max(0,min(self.current_image.height-1,int(point.y())))
-            c=QColor(*self._picker_rgb.getpixel((x,y)))
+            c=self.picker_color(point)
             self.picker_preview_item.setPixmap(picker_cursor_pixmap(c))
             self.picker_preview_item.setOffset(-49,-83)
             self.picker_preview_item.setPos(point)
@@ -1724,6 +1730,11 @@ class EditorWindow(QMainWindow):
         else:
             self.canvas.set_cleanup_boxes([],[])
             self.canvas.set_cleanup_mask(None,None)
+        if tool=='picker':
+            # Brush updates are throttled; force the latest working pixels
+            # into the displayed image before the first picker preview.
+            self._render_timer.stop()
+            self._refresh_pixmap()
         if tool!='text':
             self.canvas.setFocus()
         names={
@@ -1904,12 +1915,14 @@ class EditorWindow(QMainWindow):
         if not self._render_timer.isActive():
             self._render_timer.start(35)
 
-    def _pick(self,coords):
-        x,y=coords
-        x=max(0,min(self.working.width-1,x))
-        y=max(0,min(self.working.height-1,y))
-        pixel=self.working.convert('RGB').getpixel((x,y))
-        self._set_brush_color(QColor(*pixel).name())
+    def _pick(self, sample):
+        # QColor comes from the canvas' exact preview sample; accept point
+        # tuples as well for existing programmatic callers.
+        color = (sample if isinstance(sample, QColor) else
+                 self.canvas.picker_color(QPointF(*sample)))
+        if not color.isValid():
+            return
+        self._set_brush_color(color.name())
         self.set_tool(self.last_brush)
         self.statusBar().showMessage('Цвет: '+self.brush_color.name().upper(),6500)
 

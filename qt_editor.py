@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
+import zlib
 
 from PIL import Image
 import numpy as np
@@ -700,8 +701,6 @@ class EditorWindow(QMainWindow):
         self._text_before = None
         self._cleanup_candidates=[]
         self._cleanup_enabled=[]
-        self._cleanup_done_boxes=[]
-        self._cleanup_done_selections=set()
         self._cleanup_preview_active=False
         self._cleanup_preview_image=None
         self._cleanup_preview_boxes=()
@@ -1215,8 +1214,10 @@ class EditorWindow(QMainWindow):
         if domain == 'text':
             return (deepcopy(self.layers), self.selected_text)
         if domain == 'image':
-            return (self.working.copy(), list(self._cleanup_done_boxes),
-                    set(self._cleanup_done_selections))
+            # Lossless compressed pixel snapshots keep 50-step undo practical
+            # on full-resolution manga pages without 50 raw image copies.
+            return (self.working.mode, self.working.size,
+                    zlib.compress(self.working.tobytes(), level=1))
         raise ValueError(domain)
 
     def _restore_domain(self, domain, state):
@@ -1225,9 +1226,8 @@ class EditorWindow(QMainWindow):
             # Undo restores committed artwork, not an open editing frame.
             self.selected_text = -1
         elif domain == 'image':
-            self.working = state[0].copy()
-            self._cleanup_done_boxes = list(state[1])
-            self._cleanup_done_selections = set(state[2])
+            self.working = Image.frombytes(
+                state[0], state[1], zlib.decompress(state[2]))
         else:
             raise ValueError(domain)
         self._text_before = None
@@ -1240,7 +1240,7 @@ class EditorWindow(QMainWindow):
 
     def _record_transaction(self, domain, before):
         self.history.append((domain, before))
-        if len(self.history)>12:self.history.pop(0)
+        if len(self.history)>50:self.history.pop(0)
         self.future.clear()
         self._mark()
         self._update_history_actions()
@@ -1547,7 +1547,7 @@ class EditorWindow(QMainWindow):
     def _cleanup_parameters_changed(self,*_):
         self.settings.setValue('cleanupMode',self.cleanup_mode.currentData())
         self.settings.setValue('cleanupGrow',self.cleanup_grow.value())
-        if self.selection is not None and self.selection not in self._cleanup_done_selections:
+        if self.selection is not None:
             self.detect_cleanup()
 
     def _cleanup_repair_changed(self,*_):
@@ -1572,15 +1572,6 @@ class EditorWindow(QMainWindow):
         if self.selection is None:
             self.cleanup_stats.setText('Сначала выделите надпись.')
             return
-        if self.selection in self._cleanup_done_selections:
-            self._cleanup_candidates=[]
-            self._cleanup_enabled=[]
-            self._cleanup_base_mask=None
-            self._cleanup_labels=None
-            self._cleanup_label_ids=[]
-            self._refresh_cleanup_overlay()
-            self.cleanup_stats.setText('Область уже очищена. Ctrl+Z — отменить.')
-            return
         # No OCR: contrast segmentation on a background-dominated rectangle.
         # Each connected component is a candidate for explicit user approval.
         seg=segment_ink(self.working,self.selection,
@@ -1590,19 +1581,13 @@ class EditorWindow(QMainWindow):
         (self._cleanup_region,self._cleanup_candidates,
          self._cleanup_label_ids,self._cleanup_labels)=mask_components(
             seg.mask,self.selection)
-        self._cleanup_enabled=[
-            not any(self._boxes_overlap(box,done) for done in self._cleanup_done_boxes)
-            for box in self._cleanup_candidates]
+        # Every selection is analysed against CURRENT pixels. Prior cleanup
+        # rectangles must never suppress newly drawn or pasted lettering.
+        self._cleanup_enabled=[True]*len(self._cleanup_candidates)
         self._refresh_cleanup_overlay()
         if not self._cleanup_candidates:
             self.statusBar().showMessage(
                 'Контрастные объекты не найдены. Можно добавить рамку вручную.',6500)
-
-    @staticmethod
-    def _boxes_overlap(a,b):
-        x,y,w,h=a
-        xx,yy,ww,hh=b
-        return x<xx+ww and x+w>xx and y<yy+hh and y+h>yy
 
     def _toggle_cleanup_box(self,index):
         self._invalidate_cleanup_preview()
@@ -1660,10 +1645,6 @@ class EditorWindow(QMainWindow):
         if self.selection is None:
             self.statusBar().showMessage('Сначала выделите надпись.',6000)
             return
-        if self.selection in self._cleanup_done_selections:
-            self.statusBar().showMessage(
-                'Эта область уже очищена. Повторное применение заблокировано.',6500)
-            return
         mask=self._approved_cleanup_mask()
         if not np.any(mask):
             self.statusBar().showMessage('Нет отмеченных пикселей для удаления.',6500)
@@ -1687,10 +1668,6 @@ class EditorWindow(QMainWindow):
         self._checkpoint()
         self.working=result
         self._cleanup_last_applied_mask=mask.copy()
-        approved=[box for box,active in zip(self._cleanup_candidates,self._cleanup_enabled)
-                  if active]
-        self._cleanup_done_boxes.extend(approved)
-        self._cleanup_done_selections.add(self.selection)
         self._invalidate_cleanup_preview()
         self._cleanup_candidates=[]
         self._cleanup_enabled=[]
@@ -1907,7 +1884,7 @@ class EditorWindow(QMainWindow):
         if start is None:
             if self._stroke_in_progress and self._stroke_before is not None:
                 before=self._stroke_before
-                if self.working.tobytes()!=before[0].tobytes():
+                if self.working.tobytes()!=zlib.decompress(before[2]):
                     self._record_transaction('image',before)
             self._stroke_before=None
             self._stroke_in_progress=False

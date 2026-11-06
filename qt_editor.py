@@ -11,6 +11,9 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
 import zlib
+import logging
+import os
+from logging.handlers import RotatingFileHandler
 
 from PIL import Image
 import numpy as np
@@ -35,6 +38,26 @@ from qt_toolbar_icons import toolbar_icon
 from paint3d_tools import draw_stroke, TOOLS as PAINT_TOOLS
 
 VISIBLE_PAINT_TOOLS = ('pencil', 'fill', 'spray', 'blur', 'restore')
+
+
+def editor_logger():
+    """Local rotating diagnostics: operation names and counts, no image/text data."""
+    logger = logging.getLogger('MangaOfflineTranslator.Editor')
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        try:
+            folder = Path(os.environ.get('LOCALAPPDATA') or
+                          (Path.home() / '.cache')) / 'MangaOfflineTranslator'
+            folder.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                folder / 'editor.log', maxBytes=1024*1024, backupCount=2,
+                encoding='utf-8')
+            handler.setFormatter(logging.Formatter(
+                '%(asctime)s %(levelname)s %(message)s'))
+            logger.addHandler(handler)
+        except OSError:
+            logger.addHandler(logging.NullHandler())
+    return logger
 
 
 @dataclass
@@ -696,6 +719,7 @@ class EditorWindow(QMainWindow):
         self.selection = None
         self.history = []  # domain-specific transactions
         self.future = []
+        self._logger = editor_logger()
         self.settings = QSettings('MangaOffline','MangaOfflineTranslator')
         self.brush_color = QColor(str(self.settings.value('brushColor','#232323')))
         self.text_color = QColor(str(self.settings.value('textColor','#232323')))
@@ -727,6 +751,7 @@ class EditorWindow(QMainWindow):
         self.canvas.set_picture(self.working)
         self.canvas.set_tool('cleanup')
         self._sync()
+        self._logger.info('editor open image_size=%sx%s', *self.working.size)
         self.statusBar().showMessage('Выделите прямоугольник: фрагмент немедленно копируется как изображение.',9500)
 
     def _zoom_combo_activated(self,index):
@@ -1244,15 +1269,17 @@ class EditorWindow(QMainWindow):
             self._in_sync = False
         self._sync()
 
-    def _record_transaction(self, domain, before):
+    def _record_transaction(self, domain, before, action=None):
         self.history.append((domain, before))
         if len(self.history)>50:self.history.pop(0)
         self.future.clear()
         self._mark()
         self._update_history_actions()
+        self._logger.info('commit action=%s domain=%s undo=%d redo=%d',
+                          action or domain, domain, len(self.history), len(self.future))
 
-    def _checkpoint(self, domain='image'):
-        self._record_transaction(domain,self._capture_domain(domain))
+    def _checkpoint(self, domain='image', action=None):
+        self._record_transaction(domain,self._capture_domain(domain),action)
 
     def eventFilter(self,obj,event):
         if (obj is self.text_input and event.type()==QEvent.Type.KeyPress
@@ -1304,6 +1331,8 @@ class EditorWindow(QMainWindow):
         self.future.append((domain, self._capture_domain(domain)))
         self._restore_domain(domain, previous)
         self._update_history_actions()
+        self._logger.info('undo domain=%s undo=%d redo=%d',
+                          domain, len(self.history), len(self.future))
 
     def redo(self):
         if self._text_before is not None:
@@ -1313,6 +1342,8 @@ class EditorWindow(QMainWindow):
         self.history.append((domain, self._capture_domain(domain)))
         self._restore_domain(domain, next_state)
         self._update_history_actions()
+        self._logger.info('redo domain=%s undo=%d redo=%d',
+                          domain, len(self.history), len(self.future))
 
     def _update_history_actions(self):
         if hasattr(self,'undo_action'):
@@ -1339,6 +1370,8 @@ class EditorWindow(QMainWindow):
         self.commit_paste()
         self._reset_cleanup(clear_selection=True)
         self.selection=clip_box(box,self.working.size)
+        self._logger.info('select tool=%s region=%s', self.canvas.tool,
+                          self.selection)
         self.canvas.set_selection(self.selection)
         if self.canvas.tool=='cleanup':
             self.copy_fragment(force_image=True)
@@ -1443,7 +1476,7 @@ class EditorWindow(QMainWindow):
         valid[y-y0:y-y0+h,x-x0:x-x0+w]=False
         samples=context[valid]
         color=tuple(np.median(samples,axis=0).astype(np.uint8)) if len(samples) else (255,255,255)
-        self._checkpoint()
+        self._checkpoint(action='erase')
         new=self.working.copy()
         new.paste(Image.new('RGB',(w,h),color),(x,y))
         self.working=new
@@ -1510,7 +1543,7 @@ class EditorWindow(QMainWindow):
                                   max(1,round(source.height*scale))),
                                  Image.Resampling.LANCZOS)
         x,y=round(item.pos().x()),round(item.pos().y())
-        self._checkpoint()
+        self._checkpoint(action='paste')
         base=self.working.convert('RGBA')
         pasted=Image.new('RGBA',base.size,(0,0,0,0))
         pasted.paste(source.convert('RGBA'),(x,y))
@@ -1591,6 +1624,11 @@ class EditorWindow(QMainWindow):
         # rectangles must never suppress newly drawn or pasted lettering.
         self._cleanup_enabled=[True]*len(self._cleanup_candidates)
         self._refresh_cleanup_overlay()
+        self._logger.info(
+            'cleanup_detect region=%s mode=%s candidates=%d selected=%d mask_pixels=%d',
+            self.selection, self.cleanup_mode.currentData(),
+            len(self._cleanup_candidates), sum(self._cleanup_enabled),
+            int(np.count_nonzero(seg.mask)))
         if not self._cleanup_candidates:
             self.statusBar().showMessage(
                 'Контрастные объекты не найдены. Можно добавить рамку вручную.',6500)
@@ -1671,7 +1709,7 @@ class EditorWindow(QMainWindow):
         after=np.asarray(result.convert('RGBA'))
         if np.any(before[mask==0]!=after[mask==0]):
             raise RuntimeError('Cleanup attempted to change protected image pixels')
-        self._checkpoint()
+        self._checkpoint(action='cleanup')
         self.working=result
         self._cleanup_last_applied_mask=mask.copy()
         self._invalidate_cleanup_preview()
@@ -1896,7 +1934,8 @@ class EditorWindow(QMainWindow):
             if self._stroke_in_progress and self._stroke_before is not None:
                 before=self._stroke_before
                 if self.working.tobytes()!=zlib.decompress(before[2]):
-                    self._record_transaction('image',before)
+                    self._record_transaction('image',before,
+                                             action='brush:'+tool)
             self._stroke_before=None
             self._stroke_in_progress=False
             self._refresh_pixmap()

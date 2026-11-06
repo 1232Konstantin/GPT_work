@@ -4,6 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 
 from PIL import Image, ImageDraw
 from PySide6.QtCore import Qt, QPointF
+from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -28,6 +29,7 @@ def test_enter_commits_one_caption_without_intermediate_undo(tmp_path):
         assert len(editor.history)==0
         # Enter remains a newline in both text editors.
         editor.text_input.setPlainText('abc')
+        editor.text_input.moveCursor(QTextCursor.MoveOperation.End)
         editor.text_input.setFocus()
         QTest.keyClick(editor.text_input,Qt.Key.Key_Return)
         assert editor.text_input.toPlainText() == 'abc\n'
@@ -58,6 +60,9 @@ def test_enter_in_canvas_text_editor_is_newline(tmp_path):
         editor._create_text_box((10,10,90,60))
         item=editor.canvas.text_edit_item
         item.setPlainText('line1')
+        cursor=item.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        item.setTextCursor(cursor)
         item.setFocus()
         QTest.keyClick(editor.canvas.viewport(),Qt.Key.Key_Return)
         assert item.toPlainText() == 'line1\n'

@@ -7,6 +7,7 @@ import pytest
 from PIL import Image, ImageDraw
 from PySide6.QtCore import Qt, QPointF, QMimeData, QUrl
 from PySide6.QtGui import QDropEvent, QDragEnterEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from cleanup_v11 import segment_text, restore_text_background, _reference_colour
@@ -170,6 +171,14 @@ def test_opaque_component_overlay_and_pixel_clicks(tmp_path):
         assert rejected.name()=='#ff00ff' and rejected.alpha()==255
         assert not editor._approved_cleanup_mask()[60,75]
         assert editor._approved_cleanup_mask()[60,157]
+        # Exercise a real QGraphicsView viewport click on an opaque mask pixel.
+        editor.show()
+        app.processEvents()
+        click=editor.canvas.mapFromScene(QPointF(75,60))
+        QTest.mouseClick(editor.canvas.viewport(),Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier,click)
+        assert editor._cleanup_enabled[first], 'Mouse click must re-enable exact mask'
+        editor._toggle_cleanup_box(first)
         editor.cleanup_mask_color.setCurrentIndex(
             editor.cleanup_mask_color.findData('#ffffff'))
         assert editor.canvas.cleanup_mask_item.pixmap().toImage().pixelColor(

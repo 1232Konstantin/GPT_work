@@ -1721,8 +1721,9 @@ class EditorWindow(QMainWindow):
         self._cleanup_enabled=[True]*len(self._cleanup_candidates)
         self._refresh_cleanup_overlay()
         self._logger.info(
-            'cleanup_detect region=%s mode=%s candidates=%d selected=%d mask_pixels=%d',
+            'cleanup_detect region=%s reference=%s outline=%s candidates=%d selected=%d mask_pixels=%d',
             self.selection, self.cleanup_mode.currentData(),
+            self.cleanup_outline.isChecked(),
             len(self._cleanup_candidates), sum(self._cleanup_enabled),
             int(np.count_nonzero(seg.mask)))
         if not self._cleanup_candidates:
@@ -1804,6 +1805,8 @@ class EditorWindow(QMainWindow):
         if result.tobytes()==self.working.tobytes():
             self.statusBar().showMessage('Очистка не изменила изображение.',6500)
             return
+        self._logger.info('cleanup_fill method=%s average=%s mask_pixels=%d',
+                          method[0],method[1],int(np.count_nonzero(mask)))
         # Invariant: only the approved pixel mask can differ from the source.
         before=np.asarray(self.working.convert('RGBA'))
         after=np.asarray(result.convert('RGBA'))

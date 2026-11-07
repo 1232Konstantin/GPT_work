@@ -38,7 +38,7 @@ from qt_brush_icons import brush_icon, picker_cursor_pixmap
 from qt_toolbar_icons import toolbar_icon
 from paint3d_tools import draw_stroke, TOOLS as PAINT_TOOLS
 
-VISIBLE_PAINT_TOOLS = ('pencil', 'fill', 'spray', 'blur', 'restore')
+VISIBLE_PAINT_TOOLS = ('pencil', 'brush', 'fill', 'spray', 'blur', 'restore')
 
 
 def editor_logger():
@@ -275,11 +275,17 @@ class ImageCanvas(QGraphicsView):
         event.accept()
 
     def _queue_quality(self):
+        # No Lanczos pre-downsampling for pixel pencil: it changes hard
+        # one-pixel edges into visually soft multi-pixel brush marks.
+        if self.tool == 'pencil':
+            return
         if self.current_image is not None and self.pixmap_item is not None:
             self._view_generation += 1
             self._quality_timer.start(130)
 
     def _quality_render(self):
+        if self.tool == 'pencil':
+            return
         image = self.current_image
         if image is None or self.pixmap_item is None:
             return
@@ -309,11 +315,30 @@ class ImageCanvas(QGraphicsView):
         QThreadPool.globalInstance().start(work)
 
     def set_tool(self, tool: str):
+        old_tool = self.tool
         self.tool = tool
+        # Pixel pencil uses nearest-neighbour presentation of the full
+        # resolution raster. Other brushes keep the existing smooth viewer.
+        pixel_mode = tool == 'pencil'
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                           not pixel_mode)
+        if self.pixmap_item is not None:
+            self.pixmap_item.setTransformationMode(
+                Qt.TransformationMode.FastTransformation if pixel_mode
+                else Qt.TransformationMode.SmoothTransformation)
+        if pixel_mode:
+            self._quality_timer.stop()
+            self._view_generation += 1  # invalidate outstanding resamplers
+            if self.pixmap_item is not None and self._source_pixmap is not None:
+                self.pixmap_item.setPixmap(self._source_pixmap)
+                self._rendered_size = self.current_image.size
+        elif old_tool == 'pencil':
+            self._queue_quality()
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag
                          if tool == 'pan' else QGraphicsView.DragMode.NoDrag)
         if tool in VISIBLE_PAINT_TOOLS:
-            hotspots = {'pencil': (17,31), 'fill': (6,25),
+            hotspots = {'pencil': (17,31), 'brush': (17,31),
+                        'fill': (6,25),
                         'spray': (9,9), 'blur': (16,16), 'restore': (9,24)}
             self.viewport().setCursor(QCursor(
                 brush_icon(tool).pixmap(32,32), *hotspots[tool]))
@@ -764,6 +789,8 @@ class ImageCanvas(QGraphicsView):
 
 
 class EditorWindow(QMainWindow):
+    image_saved = Signal(object)
+
     def __init__(self, path: Path, parent=None):
         super().__init__(parent)
         self.path = Path(path)
@@ -1116,7 +1143,8 @@ class EditorWindow(QMainWindow):
         tools_grid.setVerticalSpacing(4)
         self.brush_tool_buttons={}
         brush_names=(
-            ('pencil','Карандаш'),('fill','Заливка'),
+            ('pencil','Карандаш — пиксели'),('brush','Кисть'),
+            ('fill','Заливка'),
             ('spray','Баллончик'),('blur','Размывайка'),
             ('restore','Ластик — восстановление оригинала'))
         for index,(name,label) in enumerate(brush_names):
@@ -2110,6 +2138,7 @@ class EditorWindow(QMainWindow):
         try:
             rendered=composite_text(self.working,self.layers)
             rendered.save(file,format='PNG')
+            self.image_saved.emit(file)
             self.last_saved=file;self.dirty=False
             self.setWindowTitle('Редактор — '+self.path.name)
             self.statusBar().showMessage('Сохранено без потерь: '+str(file),7000)

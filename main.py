@@ -133,7 +133,9 @@ def gui_self_test(app):
                 raise RuntimeError('Translated text not drawn in selected area')
             # Cleanup remains a suggestion until the user confirms boxes.
             import numpy as np
-            editor.cleanup_mode.setCurrentIndex(2) # outlined text
+            editor.cleanup_mode.setCurrentIndex(
+                editor.cleanup_mode.findData('border'))
+            editor.cleanup_outline.setChecked(True)  # independent outline flag
             editor.cleanup_grow.setValue(2)
             editor.set_tool('cleanup')
             editor._selected((170,155,116,68))
@@ -229,7 +231,9 @@ def gui_self_test(app):
             assert editor.preview_button.isHidden()
             assert editor.cleanup_stats.isHidden()
             assert editor.clear_button.text() == 'Очистить'
-            assert editor.cleanup_mode.findData('outline_dark')>=0
+            assert editor.cleanup_mode.findData('border')>=0
+            assert editor.cleanup_mode.findData('area')>=0
+            assert editor.cleanup_outline.isChecked()
 
             editor.set_tool('pencil')
             assert editor.sidebar_modes.currentWidget() is editor.brush_panel

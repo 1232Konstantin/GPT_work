@@ -13,7 +13,7 @@ import numpy as np
 
 TOOLS = (
     "marker", "calligraphy", "oil", "watercolor", "pixel",
-    "pencil", "crayon", "restore", "spray", "fill", "smudge", "blur"
+    "pencil", "brush", "crayon", "restore", "spray", "fill", "smudge", "blur"
 )
 
 
@@ -74,7 +74,7 @@ def draw_stroke(image: Image.Image, original: Image.Image, start, end,
     if tool not in TOOLS:
         raise ValueError("Unknown tool: "+tool)
     size=max(1,min(180,int(diameter)))
-    if tool=="pencil":size=max(1,min(size,18))
+    if tool=="brush":size=max(1,min(size,18))
     if tool=="pixel":size=max(1,min(size,48))
     r=max(0.5,size/2)
     W,H=image.size
@@ -89,8 +89,20 @@ def draw_stroke(image: Image.Image, original: Image.Image, start, end,
     patch=image.crop((left,top,right,bottom)).convert("RGBA")
     mask=Image.new("L",patch.size,0)
     draw=ImageDraw.Draw(mask)
-    if tool=="pencil" and size==1:
-        # Exactly one raster pixel at the tip for a 1px pencil.
+    if tool=="pencil":
+        # Exact source-image pixels, no antialiasing or circular dabs.
+        # Fractional mouse positions identify the containing pixel.
+        x0,y0=int(local0[0]),int(local0[1])
+        x1,y1=int(local1[0]),int(local1[1])
+        draw.line((x0,y0,x1,y1),fill=255,width=size)
+        if size>1:
+            # Explicit integer-diameter end caps with a hard edge.
+            radius=(size-1)/2
+            for x,y in ((x0,y0),(x1,y1)):
+                draw.ellipse((round(x-radius),round(y-radius),
+                              round(x+radius),round(y+radius)),fill=255)
+    elif tool=="brush" and size==1:
+        # Preserve old pencil behaviour exactly as the soft brush.
         draw.line((*local0,*local1),fill=255,width=1)
     elif tool=="pixel":
         _dabs(draw,local0,local1,r,255,ellipse=False,step=max(1,r))

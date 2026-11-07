@@ -6,7 +6,7 @@ from collections import OrderedDict
 import threading
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import Qt, QSize, QPoint, QThreadPool, QTimer
+from PySide6.QtCore import Qt, QSize, QPoint, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QBrush, QIcon, QPainter
 from PySide6.QtWidgets import (QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QListWidget,
@@ -19,7 +19,19 @@ from viewer_core import discover_images, find_duplicates, sort_images, resample_
 from qt_common import Task, pixmap_from_pil
 
 
+def _dropped_folder(mime):
+    """Accept a single local directory; reject URLs, arbitrary files and text."""
+    if not mime.hasUrls():
+        return None
+    urls = mime.urls()
+    if len(urls) != 1 or not urls[0].isLocalFile():
+        return None
+    folder = Path(urls[0].toLocalFile())
+    return folder if folder.is_dir() else None
+
+
 class PictureView(QGraphicsView):
+    folder_dropped = Signal(object)
     """Pixel-preserving zoom with asynchronous high-quality downsampling.
 
     Cached images are resized only from the original, never from a preview.
@@ -28,6 +40,8 @@ class PictureView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
         self.pixmap_item: QGraphicsPixmapItem | None = None
         self._source_image: Image.Image | None = None
         self._full_pixmap = None
@@ -45,6 +59,26 @@ class PictureView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.is_fit = True
         self.angle = 0
+
+    def dragEnterEvent(self, event):
+        if _dropped_folder(event.mimeData()) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if _dropped_folder(event.mimeData()) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        folder = _dropped_folder(event.mimeData())
+        if folder is not None:
+            self.folder_dropped.emit(folder)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def set_picture(self, image: Image.Image):
         self._quality_version += 1
@@ -225,6 +259,7 @@ class ViewerWindow(QMainWindow):
         self.setWindowTitle('Manga Offline Translator — просмотр изображений')
         self.resize(1450, 910)
         self.setMinimumSize(850, 560)
+        self.setAcceptDrops(True)
         self.threadpool = QThreadPool.globalInstance()
         self.pending: set[Task] = set()
         self.folder: Path | None = None
@@ -246,6 +281,7 @@ class ViewerWindow(QMainWindow):
         self._thumbnail_failed=set()
         self._thumbnail_active=0
         self._build_ui()
+        self.canvas.folder_dropped.connect(self.set_folder)
         # All modes live in a single top-level window; keep the viewer alive
         # while editing instead of creating a second editor window.
         viewer_widget=self.takeCentralWidget()
@@ -439,6 +475,26 @@ class ViewerWindow(QMainWindow):
         if self.library_panel.isVisible():
             self.list.setFocus()
             self._schedule_thumbnails()
+
+    def dragEnterEvent(self, event):
+        if _dropped_folder(event.mimeData()) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if _dropped_folder(event.mimeData()) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        folder = _dropped_folder(event.mimeData())
+        if folder is not None:
+            self.set_folder(folder)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Открыть папку изображений')

@@ -31,7 +31,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
 
 from engine import open_image
 from paint_core import clip_box, brush_segment, palette_smudge
-from contrast_cleanup import segment_ink, repair_background, mask_components, confirmed_mask
+from contrast_cleanup import mask_components, confirmed_mask
+from cleanup_v11 import segment_text, restore_text_background
 from qt_common import pixmap_from_pil, Task
 from qt_brush_icons import brush_icon, picker_cursor_pixmap
 from qt_toolbar_icons import toolbar_icon
@@ -186,6 +187,9 @@ class ImageCanvas(QGraphicsView):
         self.cleanup_mask_item = None
         self.cleanup_boxes = []
         self.cleanup_enabled = []
+        self.cleanup_labels = None
+        self.cleanup_label_ids = []
+        self.cleanup_region = None
         self.text_items = []
         self.text_content_items = []  # retain Python-owned QGraphicsTextItem subclasses
         self.text_handles = []
@@ -351,42 +355,96 @@ class ImageCanvas(QGraphicsView):
             self.selected_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
     def set_cleanup_boxes(self, boxes: list[tuple[int,int,int,int]], enabled: list[bool]):
+        # Keep candidates for compatibility and click selection; the user sees
+        # ONLY the true per-pixel masks, never their bounding rectangles.
         for obj in self.cleanup_items:
             if obj.scene() == self.scene():
                 self.scene().removeItem(obj)
         self.cleanup_items.clear()
         self.cleanup_boxes = list(boxes)
         self.cleanup_enabled = list(enabled)
-        for (x,y,w,h), active in zip(self.cleanup_boxes, self.cleanup_enabled):
-            outline=self.scene().addRect(QRectF(x,y,w,h),
-                QPen(QColor('#39f0a9') if active else QColor('#999999'),
-                     2.3 if active else 1.3,
-                     Qt.PenStyle.SolidLine if active else Qt.PenStyle.DashLine))
-            outline.setZValue(55)
-            outline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self.cleanup_items.append(outline)
 
-    def set_cleanup_mask(self, mask: np.ndarray | None, box):
-        # Overlay only *actual writable pixels*. Its own item has no mouse
-        # interaction; rectangle toggles still go to ImageCanvas.mousePressEvent.
+    def set_cleanup_mask(self, mask: np.ndarray | None, box, *,
+                         labels=None, label_ids=None, enabled=None,
+                         active_color='#39ff14'):
+        """Opaque exact-pixel masks: selected=color, excluded=bright magenta."""
         if self.cleanup_mask_item is not None:
             self.scene().removeItem(self.cleanup_mask_item)
             self.cleanup_mask_item = None
+        self.cleanup_labels = None
+        self.cleanup_label_ids = []
+        self.cleanup_region = None
         if mask is None or box is None:
             return
         x,y,w,h=clip_box(box,(mask.shape[1],mask.shape[0]))
         if w<=0 or h<=0:
             return
-        roi=np.asarray(mask[y:y+h,x:x+w])>0
-        if not np.any(roi):
+        if labels is None or label_ids is None or enabled is None:
             return
-        rgba=np.zeros((h,w,4),dtype=np.uint8)
-        rgba[roi]=[255,55,95,125]
-        item=self.scene().addPixmap(pixmap_from_pil(Image.fromarray(rgba,'RGBA')))
+        if labels.shape != (h,w):
+            raise ValueError('Overlay labels are not aligned with the selection')
+        if len(label_ids)!=len(self.cleanup_boxes) or len(enabled)!=len(label_ids):
+            raise ValueError('Overlay candidates and labels do not match')
+        self.cleanup_labels = labels
+        self.cleanup_label_ids = list(label_ids)
+        self.cleanup_region = (x,y,w,h)
+        on = QColor(active_color)
+        off = QColor('#ff00ff')
+        active_rgba = [on.red(),on.green(),on.blue(),255]
+        inactive_rgba = [off.red(),off.green(),off.blue(),255]
+        rgba = np.zeros((h,w,4),dtype=np.uint8)
+        # Indexed palette renders all connected components in one pass.
+        palette = np.zeros((int(labels.max())+1,4),dtype=np.uint8)
+        for label_id, selected in zip(label_ids,enabled):
+            if label_id is not None:
+                palette[label_id] = active_rgba if selected else inactive_rgba
+        rgba[:] = palette[labels]
+        for (bx,by,bw,bh),label_id,selected in zip(
+                self.cleanup_boxes,label_ids,enabled):
+            if label_id is not None:
+                continue
+            left=max(0,bx-x);top=max(0,by-y)
+            right=min(w,bx-x+bw);bottom=min(h,by-y+bh)
+            if right>left and bottom>top:
+                rgba[top:bottom,left:right] = (
+                    active_rgba if selected else inactive_rgba)
+        if not np.any(rgba[:,:,3]):
+            return
+        item=self.scene().addPixmap(
+            pixmap_from_pil(Image.fromarray(rgba,'RGBA')))
         item.setPos(x,y)
         item.setZValue(50)
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.cleanup_mask_item=item
+
+    def cleanup_component_at(self, point):
+        """Pick real ink pixels with a small SCREEN-space tolerance."""
+        if self.cleanup_labels is None or self.cleanup_region is None:
+            return None
+        x,y,w,h=self.cleanup_region
+        px=int(point.x())-x
+        py=int(point.y())-y
+        radius=min(18,max(1,round(4/max(.15,abs(self.transform().m11())))))
+        lookup={label:i for i,label in enumerate(self.cleanup_label_ids)
+                if label is not None}
+        # Closest visible pixel wins, not the smallest overlapping rectangle.
+        for distance in range(radius+1):
+            for dy in range(-distance,distance+1):
+                dx_abs=distance-abs(dy)
+                for dx in ((0,) if dx_abs==0 else (-dx_abs,dx_abs)):
+                    xx=px+dx; yy=py+dy
+                    if 0<=xx<w and 0<=yy<h:
+                        idx=lookup.get(int(self.cleanup_labels[yy,xx]))
+                        if idx is not None:
+                            return idx
+                        for i,(box,label_id) in enumerate(zip(
+                                self.cleanup_boxes,self.cleanup_label_ids)):
+                            if label_id is not None:
+                                continue
+                            bx,by,bw,bh=box
+                            if bx<=xx+x<bx+bw and by<=yy+y<by+bh:
+                                return i
+        return None
 
     def _position_text_handles(self, box):
         if not self.text_handles:
@@ -526,12 +584,9 @@ class ImageCanvas(QGraphicsView):
             return
         point = self._point(event)
         if self.tool == 'cleanup' and self.cleanup_boxes:
-            candidates=[]
-            for idx,(x,y,w,h) in enumerate(self.cleanup_boxes):
-                if x<=point.x()<=x+w and y<=point.y()<=y+h:
-                    candidates.append((w*h,idx))
-            if candidates:
-                self.cleanup_box_toggled.emit(min(candidates)[1])
+            selected=self.cleanup_component_at(point)
+            if selected is not None:
+                self.cleanup_box_toggled.emit(selected)
                 event.accept()
                 return
         if self.tool in ('new','cleanup','text','text_new','cleanup_add'):

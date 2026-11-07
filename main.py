@@ -237,7 +237,7 @@ def gui_self_test(app):
 
             editor.set_tool('pencil')
             assert editor.sidebar_modes.currentWidget() is editor.brush_panel
-            assert len(editor.brush_tool_buttons)==6
+            assert len(editor.brush_tool_buttons)==7
             assert editor.actions['brushes'].isChecked()
             editor.brush_diameter.setValue(23)
             editor.brush_opacity.setValue(55)

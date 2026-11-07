@@ -176,7 +176,7 @@ def test_cleanup_after_text_brush_and_overlapping_previous_cleanup(tmp_path):
     editor=EditorWindow(source)
     try:
         editor.cleanup_mode.setCurrentIndex(
-            editor.cleanup_mode.findData('flat'))
+            editor.cleanup_mode.findData('border'))
         selection=(20,15,60,52)
         editor._selected(selection)
         assert editor._cleanup_candidates

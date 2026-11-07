@@ -13,7 +13,16 @@ def brush_icon(kind: str) -> QIcon:
     accent=QColor("#477de0")
     p.setPen(QPen(dark,2.2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap))
     p.setBrush(accent)
-    if kind in ("marker","pixel","crayon"):
+    if kind=="brush":
+        # Brush is separate from the hard-edged pixel pencil.
+        p.setBrush(QColor("#6ca4db"))
+        p.drawRoundedRect(QRectF(22,5,11,29),3,3)
+        p.setBrush(QColor("#dcebf2"))
+        p.drawRect(QRectF(21,29,13,6))
+        p.setBrush(QColor("#e4aa76"))
+        p.drawPolygon(QPolygonF([QPointF(21,35),QPointF(34,35),
+                                  QPointF(31,48),QPointF(25,46)]))
+    elif kind in ("marker","pixel","crayon"):
         p.drawRoundedRect(QRectF(21,7,13,30),3,3)
         p.setBrush(QColor("#8d9ce5"))
         p.drawRect(QRectF(21,19,13,13))

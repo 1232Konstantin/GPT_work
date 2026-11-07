@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsItem,
     QPushButton, QToolButton, QToolBar, QPlainTextEdit, QSpinBox,
     QFontComboBox, QColorDialog, QFileDialog, QMessageBox, QFrame,
-    QMenu, QStackedWidget, QSlider, QButtonGroup, QComboBox,
+    QMenu, QStackedWidget, QSlider, QButtonGroup, QComboBox, QCheckBox,
     QGridLayout, QDialog, QDialogButtonBox, QFormLayout, QScrollArea)
 
 from engine import open_image
@@ -923,17 +923,54 @@ class EditorWindow(QMainWindow):
         head=QLabel('Очистка текста')
         head.setStyleSheet('color:#8dcaff;font-size:16px;font-weight:500;')
         sel.addWidget(head)
-        sel.addWidget(QLabel('Тип текста'))
+        sel.addWidget(QLabel('Поиск символов — оценка фона'))
         self.cleanup_mode=QComboBox()
-        self.cleanup_mode.addItem('Тёмный', 'dark')
-        self.cleanup_mode.addItem('Светлый', 'light')
-        self.cleanup_mode.addItem('С обводкой', 'outline')
-        self.cleanup_mode.addItem('С тёмной обводкой', 'outline_dark')
-        self.cleanup_mode.addItem('Ровный фон', 'flat')
-        idx=self.cleanup_mode.findData(str(self.settings.value('cleanupMode','outline')))
-        self.cleanup_mode.setCurrentIndex(max(0,idx))
+        self.cleanup_mode.addItem('По границам выделения', 'border')
+        self.cleanup_mode.addItem('По цветам внутри выделения', 'area')
+        old_mode=str(self.settings.value('cleanupMode','outline'))
+        reference=old_mode if old_mode in ('border','area') else (
+            'border' if old_mode=='flat' else 'area')
+        self.cleanup_mode.setCurrentIndex(self.cleanup_mode.findData(reference))
         self.cleanup_mode.currentIndexChanged.connect(self._cleanup_parameters_changed)
         sel.addWidget(self.cleanup_mode)
+        self.cleanup_outline=QCheckBox('Текст с обводкой — заполнить контуры')
+        self.cleanup_outline.setChecked(self._saved_bool(
+            'cleanupOutline',old_mode in ('outline','outline_dark')))
+        self.cleanup_outline.toggled.connect(self._cleanup_parameters_changed)
+        sel.addWidget(self.cleanup_outline)
+        sel.addWidget(QLabel('Восстановление фона — заполнение маски'))
+        self.cleanup_method=QComboBox()
+        for name, key in (
+                ('По соседним пикселям (Telea)', 'telea'),
+                ('Градиент слева направо', 'horizontal'),
+                ('Градиент сверху вниз', 'vertical'),
+                ('Двумерный градиент', 'plane'),
+                ('Квадратичная поверхность', 'quadratic'),
+                ('Однотонная заливка', 'solid')):
+            self.cleanup_method.addItem(name,key)
+        method_idx=self.cleanup_method.findData(
+            str(self.settings.value('cleanupMethod','telea')))
+        self.cleanup_method.setCurrentIndex(max(0,method_idx))
+        self.cleanup_method.currentIndexChanged.connect(self._cleanup_repair_changed)
+        sel.addWidget(self.cleanup_method)
+        self.cleanup_average=QCheckBox('Усреднить (коррекция цвета фона)')
+        self.cleanup_average.setChecked(self._saved_bool('cleanupAverage',False))
+        self.cleanup_average.toggled.connect(self._cleanup_repair_changed)
+        sel.addWidget(self.cleanup_average)
+        sel.addWidget(QLabel('Цвет отображения масок'))
+        self.cleanup_mask_color=QComboBox()
+        for name, colour in (
+                ('Кислотно-зелёный', '#39ff14'),
+                ('Чёрный', '#000000'),
+                ('Красный', '#ff2020'),
+                ('Белый', '#ffffff')):
+            self.cleanup_mask_color.addItem(name,colour)
+        col_idx=self.cleanup_mask_color.findData(
+            str(self.settings.value('cleanupMaskColor','#39ff14')))
+        self.cleanup_mask_color.setCurrentIndex(max(0,col_idx))
+        self.cleanup_mask_color.currentIndexChanged.connect(self._cleanup_mask_color_changed)
+        sel.addWidget(self.cleanup_mask_color)
+        sel.addWidget(QLabel('Исключённая маска — ярко-пурпурная'))
         self.clear_button=QPushButton('Очистить')
         self.clear_button.setMinimumHeight(40)
         self.clear_button.clicked.connect(self.clear_selection)
@@ -964,14 +1001,6 @@ class EditorWindow(QMainWindow):
         self.advanced_cleanup=QDialog(self)
         self.advanced_cleanup.setWindowTitle('Расширенные настройки очистки')
         form=QFormLayout(self.advanced_cleanup)
-        self.cleanup_method=QComboBox(self.advanced_cleanup)
-        self.cleanup_method.addItem('Telea — текстура и градиенты','telea')
-        self.cleanup_method.addItem('Линейный градиент','plane')
-        self.cleanup_method.addItem('Квадратичный градиент','quadratic')
-        method_idx=self.cleanup_method.findData(str(self.settings.value('cleanupMethod','telea')))
-        self.cleanup_method.setCurrentIndex(max(0,method_idx))
-        self.cleanup_method.currentIndexChanged.connect(self._cleanup_repair_changed)
-        form.addRow('Восстановление фона',self.cleanup_method)
         self.cleanup_grow=QSpinBox(self.advanced_cleanup)
         self.cleanup_grow.setRange(0,3)
         self.cleanup_grow.setValue(int(self.settings.value('cleanupGrow',2)))
@@ -1636,17 +1665,27 @@ class EditorWindow(QMainWindow):
             self.canvas.set_cleanup_mask(None,None)
         else:
             self.canvas.set_cleanup_boxes(self._cleanup_candidates,self._cleanup_enabled)
-            self.canvas.set_cleanup_mask(self._approved_cleanup_mask(),self.selection)
+            self.canvas.set_cleanup_mask(
+                self._approved_cleanup_mask(),self.selection,
+                labels=self._cleanup_labels,label_ids=self._cleanup_label_ids,
+                enabled=self._cleanup_enabled,
+                active_color=self.cleanup_mask_color.currentData())
 
     def _cleanup_parameters_changed(self,*_):
         self.settings.setValue('cleanupMode',self.cleanup_mode.currentData())
+        self.settings.setValue('cleanupOutline',self.cleanup_outline.isChecked())
         self.settings.setValue('cleanupGrow',self.cleanup_grow.value())
         if self.selection is not None:
             self.detect_cleanup()
 
     def _cleanup_repair_changed(self,*_):
         self.settings.setValue('cleanupMethod',self.cleanup_method.currentData())
+        self.settings.setValue('cleanupAverage',self.cleanup_average.isChecked())
         self._invalidate_cleanup_preview()
+        self._refresh_cleanup_overlay()
+
+    def _cleanup_mask_color_changed(self,*_):
+        self.settings.setValue('cleanupMaskColor',self.cleanup_mask_color.currentData())
         self._refresh_cleanup_overlay()
 
     def _stop_cleanup_preview(self):
@@ -1668,9 +1707,11 @@ class EditorWindow(QMainWindow):
             return
         # No OCR: contrast segmentation on a background-dominated rectangle.
         # Each connected component is a candidate for explicit user approval.
-        seg=segment_ink(self.working,self.selection,
-                        mode=self.cleanup_mode.currentData(),
-                        grow=self.cleanup_grow.value())
+        seg=segment_text(
+            self.working,self.selection,
+            reference=self.cleanup_mode.currentData(),
+            outlined=self.cleanup_outline.isChecked(),
+            grow=self.cleanup_grow.value())
         self._cleanup_base_mask=seg.mask
         (self._cleanup_region,self._cleanup_candidates,
          self._cleanup_label_ids,self._cleanup_labels)=mask_components(
@@ -1722,14 +1763,16 @@ class EditorWindow(QMainWindow):
         mask=self._approved_cleanup_mask()
         if not np.any(mask):
             return
-        method=self.cleanup_method.currentData()
+        method=(self.cleanup_method.currentData(),
+                self.cleanup_average.isChecked())
         if (self._cleanup_preview_image is not None
                 and self._cleanup_preview_base is self.working
                 and self._cleanup_preview_method==method
                 and np.array_equal(mask,self._cleanup_preview_mask)):
             preview=self._cleanup_preview_image
         else:
-            preview=repair_background(self.working,mask,method)
+            preview=restore_text_background(
+                self.working,mask,self.selection,*method)
             self._cleanup_preview_image=preview
             self._cleanup_preview_base=self.working
             self._cleanup_preview_mask=mask.copy()
@@ -1748,14 +1791,16 @@ class EditorWindow(QMainWindow):
         if not np.any(mask):
             self.statusBar().showMessage('Нет отмеченных пикселей для удаления.',6500)
             return
-        method=self.cleanup_method.currentData()
+        method=(self.cleanup_method.currentData(),
+                self.cleanup_average.isChecked())
         if (self._cleanup_preview_image is not None
                 and self._cleanup_preview_base is self.working
                 and self._cleanup_preview_method==method
                 and np.array_equal(mask,self._cleanup_preview_mask)):
             result=self._cleanup_preview_image.copy()
         else:
-            result=repair_background(self.working,mask,method)
+            result=restore_text_background(
+                self.working,mask,self.selection,*method)
         if result.tobytes()==self.working.tobytes():
             self.statusBar().showMessage('Очистка не изменила изображение.',6500)
             return

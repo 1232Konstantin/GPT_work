@@ -36,7 +36,7 @@ def test_image_and_text_commands_are_independent(tmp_path):
     editor = EditorWindow(source)
     try:
         assert editor.sidebar_modes.count() == 3
-        assert editor.cleanup_mode.findData('flat') >= 0
+        assert editor.cleanup_mode.findData('border') >= 0
         editor._checkpoint('image')
         editor.working.putpixel((10, 10), (0,0,0))
         editor._checkpoint('text')

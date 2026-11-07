@@ -5,6 +5,7 @@ on:
       - main
       - v0.9-development
       - v0.10-development
+      - v0.11-development
     tags:
       - 'v*'
   workflow_dispatch:
@@ -79,6 +80,22 @@ jobs:
             gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.10.0 preview.3' --notes '0.10 corrective preview: cleanup again recognizes lettering after painting, text edits and Undo/Redo; picker preview and click use the same pixel; up to 50 compressed Undo steps. Enter still adds a line; Ctrl+Enter applies text. All earlier v0.10 features retained.' --prerelease
           }
           if ($LASTEXITCODE -ne 0) { throw 'v0.10 preview release publication failed' }
+      - name: Publish v0.11 preview from development branch
+        if: github.ref == 'refs/heads/v0.11-development'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v0.11.0-preview.1'
+          $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_0.11.0_win64.exe | Select-Object -First 1
+          if (-not $setup) { throw 'No v0.11 installer' }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $setup.FullName --clobber
+          } else {
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.11.0 preview.1' --notes 'Independent mask search and background reconstruction; outline and grid averaging options; opaque selectable pixel masks (green, black, red or white; excluded masks magenta); horizontal/vertical/solid fill plus advanced reconstruction; drag-and-drop a local folder into the viewer. Legacy workflows, brush/text tools and 50-step Undo/Redo preserved.' --prerelease
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'v0.11 preview release publication failed' }
       - name: Publish preview installer on main
         if: github.ref == 'refs/heads/main'
         shell: pwsh

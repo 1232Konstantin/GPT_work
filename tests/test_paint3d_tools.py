@@ -7,7 +7,7 @@ from paint3d_tools import draw_stroke, fill_region, TOOLS
 
 @pytest.mark.parametrize("tool",[
     "marker","calligraphy","oil","watercolor","pixel",
-    "pencil","crayon","spray"
+    "pencil","brush","crayon","spray"
 ])
 def test_brush_stroke_local_and_source_untouched(tool):
     src=Image.new("RGB",(130,96),(240,235,225))

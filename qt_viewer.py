@@ -6,7 +6,7 @@ from collections import OrderedDict
 import threading
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import Qt, QSize, QPoint, QThreadPool, QTimer, Signal
+from PySide6.QtCore import Qt, QSize, QPoint, QThreadPool, QTimer, Signal, QFileSystemWatcher
 from PySide6.QtGui import QAction, QColor, QBrush, QIcon, QPainter
 from PySide6.QtWidgets import (QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QListWidget,
@@ -280,6 +280,12 @@ class ViewerWindow(QMainWindow):
         self._thumbnail_pending=set()
         self._thumbnail_failed=set()
         self._thumbnail_active=0
+        self._folder_watcher = QFileSystemWatcher(self)
+        self._folder_watcher.directoryChanged.connect(self._schedule_folder_refresh)
+        self._folder_refresh_timer = QTimer(self)
+        self._folder_refresh_timer.setSingleShot(True)
+        self._folder_refresh_timer.timeout.connect(self._refresh_folder_listing)
+        self._folder_refresh_serial = 0
         self._build_ui()
         self.canvas.folder_dropped.connect(self.set_folder)
         # All modes live in a single top-level window; keep the viewer alive
@@ -509,10 +515,13 @@ class ViewerWindow(QMainWindow):
 
     def set_folder(self, folder: Path, selected: Path | None = None):
         self.cancel_duplicates()
+        self._folder_refresh_timer.stop()
+        self._folder_refresh_serial += 1
         self.folder_generation += 1
         self._thumbnail_failed.clear()
         generation = self.folder_generation
         self.folder = folder
+        self._watch_folder()
         self.path_label.setText(str(folder))
         self.dup_scan = None
         self.dup_map = {}
@@ -526,6 +535,7 @@ class ViewerWindow(QMainWindow):
             if generation != self.folder_generation:
                 return
             self.paths = paths
+            self._watch_folder()
             self.sort_current()
             if selected in self.visible:
                 self.select_path(selected)
@@ -539,6 +549,96 @@ class ViewerWindow(QMainWindow):
                 self.edit_action.setEnabled(False)
             self.statusBar().showMessage(f'Найдено {len(paths)} изображений', 6500)
         self.run_task(lambda _: discover_images(folder, recursive), finished)
+
+    def _watch_folder(self):
+        """Watch the opened directory and discovered subdirectories.
+
+        Refreshes after external saves without repeatedly opening images.
+        Directory watches do not depend on the saved file already existing.
+        """
+        old=self._folder_watcher.directories()
+        if old:
+            self._folder_watcher.removePaths(old)
+        if self.folder is None or not self.folder.is_dir():
+            return
+        folders={self.folder}
+        if self.recursive.isChecked():
+            # Watch parent directories of discovered images and immediate
+            # subdirectories, including those that are currently empty.
+            try:
+                folders.update(p for p in self.folder.iterdir() if p.is_dir())
+            except OSError:
+                pass
+            for file in self.paths:
+                parent=file.parent
+                while parent!=self.folder and parent.is_relative_to(self.folder):
+                    folders.add(parent)
+                    parent=parent.parent
+        # Avoid exhausting native watcher resources in very large libraries.
+        paths=[str(p) for p in sorted(folders,key=lambda p:(len(p.parts),str(p)))[:256]
+               if p.is_dir()]
+        if paths:
+            self._folder_watcher.addPaths(paths)
+
+    def _schedule_folder_refresh(self,*_):
+        if self.folder is not None:
+            # Coalesce bursts of Windows directory notifications.
+            self._folder_refresh_timer.start(300)
+
+    def _on_editor_saved(self,path):
+        if self.folder is None:
+            return
+        path=Path(path)
+        if (path.parent==self.folder or
+                (self.recursive.isChecked() and path.is_relative_to(self.folder))):
+            # Explicit notification covers file-system implementations where
+            # a native directory watcher may not report a new file promptly.
+            self._schedule_folder_refresh()
+
+    def _refresh_folder_listing(self):
+        if self.folder is None:
+            return
+        folder=self.folder
+        generation=self.folder_generation
+        self._folder_refresh_serial += 1
+        serial=self._folder_refresh_serial
+        recursive=self.recursive.isChecked()
+
+        def finished(paths):
+            if (self.folder!=folder or generation!=self.folder_generation
+                    or serial!=self._folder_refresh_serial):
+                return
+            self._watch_folder()
+            previous=set(self.paths)
+            updated=set(paths)
+            if previous==updated:
+                return
+            for path in previous-updated:
+                self.thumbnail_cache.pop(path,None)
+                self._thumbnail_failed.discard(path)
+            self.paths=paths
+            # A duplicate scan belongs to the old set of files.
+            self.dup_scan=None
+            self.dup_map.clear()
+            self.only_dups.blockSignals(True)
+            self.only_dups.setChecked(False)
+            self.only_dups.blockSignals(False)
+            self.dup_label.setText('Список изменён; поиск дубликатов сброшен')
+            self.sort_current()
+            if self.current not in self.visible:
+                if self.visible:
+                    self.select_path(self.visible[0])
+                else:
+                    self.current=None
+                    self.edit_action.setEnabled(False)
+                    self.title_label.setText('В папке нет изображений')
+                    self.counter_label.setText('0 / 0')
+            # If the current image still exists, retain the displayed image,
+            # zoom, selection and active editor without reopening its file.
+            self.statusBar().showMessage(
+                f'Список обновлён: {len(self.paths)} изображений',4000)
+
+        self.run_task(lambda _: discover_images(folder,recursive),finished)
 
     def rescan_folder(self):
         if self.folder:
@@ -570,7 +670,9 @@ class ViewerWindow(QMainWindow):
                 item.setToolTip(str(path))
             self.list.addItem(item)
         if self.current in self.visible:
-            self.list.setCurrentRow(self.visible.index(self.current))
+            index=self.visible.index(self.current)
+            self.list.setCurrentRow(index)
+            self.counter_label.setText(f'{index+1} / {len(self.visible)}')
         self.list.blockSignals(False)
         self._update_buttons()
         self._schedule_thumbnails()
@@ -837,6 +939,7 @@ class ViewerWindow(QMainWindow):
             # with a parent. Force it to be a regular embedded widget.
             editor.setWindowFlags(Qt.WindowType.Widget)
             editor.return_to_viewer=self._return_to_viewer
+            editor.image_saved.connect(self._on_editor_saved)
             self.mode_stack.addWidget(editor)
             self.editor_by_path[self.current]=editor
         self.mode_stack.setCurrentWidget(editor)

@@ -26,40 +26,52 @@ def _boundary_samples(rgb):
                            rgb[1:-1, -1]), axis=0)
 
 
-def _components(binary, *, max_fraction=0.35):
-    """Reject isolated noise, huge fills and contours running along ROI edges."""
+def _components(binary, *, max_fraction=0.98):
+    """Keep actual foreground components, even when selection clips glyphs.
+
+    A user's tight rectangle can cut a character or a coloured stroke at
+    any edge. Touching that edge is NOT evidence that the stroke is noise.
+    """
     height, width = binary.shape
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         np.uint8(binary), connectivity=8)
     accepted = np.zeros((height, width), dtype=np.uint8)
     for i in range(1, n):
-        x, y, w, h, area = map(int, stats[i])
-        if area < 2 or area > width * height * max_fraction:
-            continue
-        if x == 0 or y == 0 or x + w >= width or y + h >= height:
-            continue
-        if w > width * 0.86 or h > height * 0.86:
-            continue
-        accepted[labels == i] = 255
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if 2 <= area <= width * height * max_fraction:
+            accepted[labels == i] = 255
     return accepted
 
 
 def _fill_outlined_interiors(mask):
-    """Fill the interiors of detected closed glyph strokes, not whole selection."""
+    """Include enclosed background regions, without filling open shapes.
+
+    A 3-pixel closing seals tiny holes in anti-aliased outlines. The holes
+    themselves are identified by connected background components which do
+    not reach the selection edge. We never fill an arbitrary external contour.
+    """
     h, w = mask.shape
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+    if h < 3 or w < 3:
+        return mask.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    inverse = np.uint8(closed == 0)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        inverse, connectivity=8)
     filled = mask.copy()
-    for contour in contours:
-        x, y, cw, ch = cv2.boundingRect(contour)
-        area = cv2.contourArea(contour)
+    for i in range(1, n):
+        x, y, cw, ch, area = map(int, stats[i])
         if area < 4 or area > w * h * .28:
+            continue
+        if x == 0 or y == 0 or x + cw >= w or y + ch >= h:
             continue
         if cw > w * .85 or ch > h * .85:
             continue
-        if x <= 0 or y <= 0 or x + cw >= w or y + ch >= h:
-            continue
-        cv2.drawContours(filled, [contour], -1, 255, -1)
+        filled[labels == i] = 255
+        # Seal only the tiny breaks adjacent to an accepted hole.
+        vicinity = cv2.dilate(np.uint8(labels == i),
+                              kernel, iterations=1) > 0
+        filled[vicinity & (closed > 0)] = 255
     return filled
 
 
@@ -81,39 +93,32 @@ def segment_text(image: Image.Image, region, *,
                                   lab[1:-1, 0], lab[1:-1, -1]), axis=0)
     else:
         samples = lab.reshape(-1, 3)
-    # A robust median resists glyph pixels but respects the chosen source.
+    # Robust background estimate: border samples for tight text crops,
+    # interior samples for a background-dominated user selection.
     base = np.median(samples, axis=0)
     luminance_delta = lab[:, :, 0] - base[0]
     chroma_delta = np.linalg.norm(lab[:, :, 1:3] - base[1:3], axis=2)
-    global_contrast = np.abs(luminance_delta)
-    h, w = crop.shape[:2]
-    k = min(35, max(3, (min(h, w) // 3) | 1))
-    local = cv2.medianBlur(np.uint8(lab), k).astype(np.float32)
-    local_contrast = np.max(np.abs(lab - local), axis=2)
-    lum = np.uint8(lab[:, :, 0])
-    morph_dark = np.zeros((h, w), dtype=np.float32)
-    morph_light = np.zeros((h, w), dtype=np.float32)
-    for diameter in (5, 9, 15, 23):
-        if diameter >= min(h, w):
-            continue
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (diameter, diameter))
-        closed = cv2.morphologyEx(lum, cv2.MORPH_CLOSE, kernel)
-        opened = cv2.morphologyEx(lum, cv2.MORPH_OPEN, kernel)
-        morph_dark = np.maximum(morph_dark,
-                                closed.astype(np.float32) - lum)
-        morph_light = np.maximum(morph_light,
-                                 lum - opened.astype(np.float32))
-    local_stroke = np.maximum(local_contrast, np.maximum(morph_dark, morph_light))
-    if reference == 'border':
-        # Border-based mode deliberately tolerates large solid glyph bodies.
-        candidates = (global_contrast >= 24) | (chroma_delta >= 27)
-    else:
-        # Colour/contrast relative to interior; local evidence suppresses
-        # gradual background changes that are not lettering.
-        candidates = ((global_contrast >= 25) | (chroma_delta >= 27))
-        candidates &= (local_stroke >= 13) | (global_contrast >= 65)
-    core = _components(candidates, max_fraction=.52)
+
+    # Set thresholds by background variation, rather than fixed values
+    # demanding strongly contrasting lettering on every page. Floors avoid
+    # classifying tiny RGB/printing noise as foreground. Caps allow lettering
+    # to remain detectable on moderately varying backgrounds.
+    luminance_spread = float(np.median(np.abs(samples[:, 0] - base[0])))
+    colour_spread = float(np.median(np.linalg.norm(
+        samples[:, 1:3] - base[1:3], axis=1)))
+    luminance_threshold = float(np.clip(10.0 + 2.0 * luminance_spread,
+                                         12.0, 34.0))
+    colour_threshold = float(np.clip(12.0 + 2.0 * colour_spread,
+                                      14.0, 35.0))
+    dark = luminance_delta <= -luminance_threshold
+    light = luminance_delta >= luminance_threshold
+    different_colour = chroma_delta >= colour_threshold
+
+    # Three INDEPENDENT reasons to mark a pixel: dark ink, light ink, or
+    # different hue. Never require a second luminance/local-edge condition
+    # for colour: it would erase the solid middle of pink-on-gray glyphs.
+    candidates = dark | light | different_colour
+    core = _components(candidates)
     if outlined:
         core = _fill_outlined_interiors(core)
     if grow > 0:
@@ -125,10 +130,8 @@ def segment_text(image: Image.Image, region, *,
     # Output contracts remain compatible with the earlier segmentation API.
     dark = empty.copy()
     light = empty.copy()
-    dark[y0:y1, x0:x1] = np.uint8(
-        (core > 0) & (luminance_delta < -22)) * 255
-    light[y0:y1, x0:x1] = np.uint8(
-        (core > 0) & (luminance_delta > 22)) * 255
+    dark[y0:y1, x0:x1] = np.uint8((core > 0) & dark) * 255
+    light[y0:y1, x0:x1] = np.uint8((core > 0) & light) * 255
     return Segmentation(full, dark, light, rgb.copy())
 
 

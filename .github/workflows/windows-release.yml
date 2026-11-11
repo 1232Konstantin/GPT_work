@@ -86,14 +86,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = 'v0.11.0-preview.2'
+          $tag = 'v0.11.0-preview.3'
           $setup = Get-ChildItem release/MangaOfflineTranslator_Setup_0.11.0_win64.exe | Select-Object -First 1
           if (-not $setup) { throw 'No v0.11 installer' }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $setup.FullName --clobber
           } else {
-            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.11.0 preview.2' --notes 'v0.11 preview.2: hard-edged pixel-perfect pencil with no canvas downsampling, original soft brush retained as a separate tool, separate size settings, and live image-folder list refresh after PNG save or external changes. Includes all previous v0.11 mask-search, outline, background-fill, drag-and-drop, undo/redo and text improvements.' --prerelease
+            gh release create $tag $setup.FullName --target "$env:GITHUB_SHA" --title 'Manga Offline Translator 0.11.0 preview.3' --notes 'v0.11 preview.3: contrast and colour are independent ways of detecting glyphs; adaptive thresholds recover weak dark/light and nearly isoluminant coloured lettering; clipped letters at selection edges are retained; outline mode fills enclosed shapes rather than open contours. Search modes renamed По границам / По фону with persistent IDs unchanged. Expanded regression tests, pixel-pencil, brush and folder watching all retained.' --prerelease
           }
           if ($LASTEXITCODE -ne 0) { throw 'v0.11 preview release publication failed' }
       - name: Publish preview installer on main

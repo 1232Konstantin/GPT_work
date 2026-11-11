@@ -952,8 +952,8 @@ class EditorWindow(QMainWindow):
         sel.addWidget(head)
         sel.addWidget(QLabel('Поиск символов — оценка фона'))
         self.cleanup_mode=QComboBox()
-        self.cleanup_mode.addItem('По границам выделения', 'border')
-        self.cleanup_mode.addItem('По цветам внутри выделения', 'area')
+        self.cleanup_mode.addItem('По границам', 'border')
+        self.cleanup_mode.addItem('По фону', 'area')
         old_mode=str(self.settings.value('cleanupMode','outline'))
         reference=old_mode if old_mode in ('border','area') else (
             'border' if old_mode=='flat' else 'area')

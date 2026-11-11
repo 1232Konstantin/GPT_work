@@ -110,14 +110,14 @@ def segment_text(image: Image.Image, region, *,
                                          12.0, 34.0))
     colour_threshold = float(np.clip(12.0 + 2.0 * colour_spread,
                                       14.0, 35.0))
-    dark = luminance_delta <= -luminance_threshold
-    light = luminance_delta >= luminance_threshold
+    dark_pixels = luminance_delta <= -luminance_threshold
+    light_pixels = luminance_delta >= luminance_threshold
     different_colour = chroma_delta >= colour_threshold
 
     # Three INDEPENDENT reasons to mark a pixel: dark ink, light ink, or
     # different hue. Never require a second luminance/local-edge condition
     # for colour: it would erase the solid middle of pink-on-gray glyphs.
-    candidates = dark | light | different_colour
+    candidates = dark_pixels | light_pixels | different_colour
     core = _components(candidates)
     if outlined:
         core = _fill_outlined_interiors(core)
@@ -130,8 +130,8 @@ def segment_text(image: Image.Image, region, *,
     # Output contracts remain compatible with the earlier segmentation API.
     dark = empty.copy()
     light = empty.copy()
-    dark[y0:y1, x0:x1] = np.uint8((core > 0) & dark) * 255
-    light[y0:y1, x0:x1] = np.uint8((core > 0) & light) * 255
+    dark[y0:y1, x0:x1] = np.uint8((core > 0) & dark_pixels) * 255
+    light[y0:y1, x0:x1] = np.uint8((core > 0) & light_pixels) * 255
     return Segmentation(full, dark, light, rgb.copy())
 
 

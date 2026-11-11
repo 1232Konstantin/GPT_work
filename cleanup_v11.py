@@ -7,6 +7,7 @@ estimate across its interior. Reconstruction uses the CURRENT pixel image.
 from __future__ import annotations
 
 import cv2
+import logging
 import numpy as np
 from PIL import Image
 
@@ -121,6 +122,15 @@ def segment_text(image: Image.Image, region, *,
     core = _components(candidates)
     if outlined:
         core = _fill_outlined_interiors(core)
+    logging.getLogger('MangaOfflineTranslator.Editor').info(
+        'segment reference=%s outlined=%s lum_threshold=%.1f '
+        'colour_threshold=%.1f dark_px=%d light_px=%d colour_px=%d '
+        'accepted_px=%d',
+        reference, outlined, luminance_threshold, colour_threshold,
+        int(np.count_nonzero(dark_pixels)),
+        int(np.count_nonzero(light_pixels)),
+        int(np.count_nonzero(different_colour)),
+        int(np.count_nonzero(core)))
     if grow > 0:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))

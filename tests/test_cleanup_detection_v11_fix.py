@@ -9,7 +9,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import cv2
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtWidgets import QApplication
 
 from cleanup_v11 import segment_text
@@ -122,3 +122,26 @@ def test_mode_names_and_persistent_keys(tmp_path):
     finally:
         editor.dirty=False
         editor.close()
+
+
+@pytest.mark.parametrize('reference',['border','area'])
+def test_antialiased_coloured_text_on_subtle_gradient(reference):
+    """Actual rasterized font, not just solid rectangular test glyphs."""
+    height,width=160,300
+    yy,xx=np.mgrid[:height,:width]
+    shade=np.uint8(np.clip(180+7*np.sin(xx/37)+5*np.cos(yy/32),0,255))
+    rgb=np.repeat(shade[:,:,None],3,axis=2)
+    picture=Image.fromarray(rgb,'RGB')
+    font=ImageFont.load_default(size=31)
+    pos=(50,55)
+    ink=Image.new('L',(width,height),0)
+    ImageDraw.Draw(ink).text(pos,'PINK LETTERS',font=font,fill=255)
+    foreground=Image.new('RGB',(width,height),(206,165,181))
+    picture.paste(foreground,(0,0),ink)
+    seg=segment_text(picture,(25,25,250,112),reference=reference,
+                     outlined=False,grow=1)
+    high_confidence=np.asarray(ink)>220
+    assert high_confidence.sum()>400
+    recall=np.mean((seg.mask>0)[high_confidence])
+    assert recall>0.93,(reference,recall)
+    assert seg.mask[8,8]==0
